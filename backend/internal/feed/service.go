@@ -74,6 +74,11 @@ type FeedService struct {
 	rerankTopN     int
 	rerankDegraded atomic.Int64
 	rerankCache    *cache.Cache
+
+	// exposedFilterTTL 是曝光过滤集合的滑动过期时间（默认 30 分钟）。
+	exposedFilterTTL time.Duration
+	// onExposedRecorded 是异步写入曝光集合完成时的回调钩子（主要用于测试同步消除竞态）。
+	onExposedRecorded func(accountID uint, ids []uint)
 }
 
 // CandidateFilter 是"这条候选该不该推给这个用户"的判定。
@@ -116,7 +121,14 @@ type CachedFeedData struct {
 }
 
 func NewFeedService(repo FeedStore, likeRepo LikeLookup, rediscache *rediscache.Client) *FeedService {
-	return &FeedService{repo: repo, likeRepo: likeRepo, rediscache: rediscache, localcache: cache.New(3*time.Second, 5*time.Second), cacheTTL: 24 * time.Hour}
+	return &FeedService{
+		repo:             repo,
+		likeRepo:         likeRepo,
+		rediscache:       rediscache,
+		localcache:       cache.New(3*time.Second, 5*time.Second),
+		cacheTTL:         24 * time.Hour,
+		exposedFilterTTL: DefaultExposedFilterTTL,
+	}
 }
 
 // WithSummaryLookup 注入 AI 摘要查询能力，返回自身以支持链式装配。
@@ -466,12 +478,28 @@ const (
 // 而"全局兴趣向量"只是热榜的另一种算法（P2 §4.5 对"新用户"的要求）。
 func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore time.Time, viewerAccountID uint) (ListLatestResponse, error) {
 	plan := buildQuotaPlan(limit, f.recallQuota, f.exploreQuota)
+	var (
+		resp ListLatestResponse
+		err  error
+	)
 	if !plan.Enabled() {
 		// P2 关闭：一条额外查询都不发、一行额外代码都不执行。
 		// 这个早退是"三关全闭时与基准线逐字节一致"的实现方式。
-		return f.listLatestBaseline(ctx, limit, latestBefore, viewerAccountID)
+		resp, err = f.listLatestBaseline(ctx, limit, latestBefore, viewerAccountID)
+	} else {
+		resp, err = f.listLatestFused(ctx, limit, latestBefore, viewerAccountID, plan)
 	}
-	return f.listLatestFused(ctx, limit, latestBefore, viewerAccountID, plan)
+	if err != nil {
+		return ListLatestResponse{}, err
+	}
+	if len(resp.VideoList) > 0 && viewerAccountID > 0 && f.rediscache != nil {
+		videoIDs := make([]uint, len(resp.VideoList))
+		for i, item := range resp.VideoList {
+			videoIDs[i] = item.ID
+		}
+		f.recordExposedAsync(viewerAccountID, videoIDs)
+	}
+	return resp, nil
 }
 
 // listLatestBaseline 是 P2 之前的那条读路径（时序 + 冷热拼接 + 分页）。

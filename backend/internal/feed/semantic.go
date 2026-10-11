@@ -103,11 +103,16 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 	}
 
 	// 2. 内存向量池余弦相似度打分与 Top-K 截取（纯内存计算，耗时 <2ms）。
-	// 在检索前获取最新一批视频 ID 集合用于前置排除（让位给时序路）。
+	// 在检索前获取最新一批视频 ID 集合用于前置排除（让位给时序路），
+	// 以及获取用户近期已看视频曝光集合用于滑动过滤（消除跨页重复推荐）。
 	excluded := f.warmupExclusionSet(opCtx)
+	exposed := f.getExposedFilterSet(opCtx, viewerAccountID)
 
 	scored := f.vectorPool.SearchCosine(profile, SemanticMaxCandidates, func(item video.VectorItem) bool {
 		if excluded != nil && excluded[item.VideoID] {
+			return false
+		}
+		if exposed != nil && exposed[item.VideoID] {
 			return false
 		}
 		return true
@@ -131,7 +136,7 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 		videoByID[v.ID] = v
 	}
 
-	// 4. 过滤：无效 ID、缺失视频、作者自看等。顺序保持打分顺序。
+	// 4. 过滤：无效 ID、缺失视频、曝光过滤、作者自看等。顺序保持打分顺序。
 	hits := make([]SemanticHit, 0, len(scored))
 	for _, s := range scored {
 		v := videoByID[s.Item.VideoID]
@@ -142,6 +147,10 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 		}
 		if excluded != nil && excluded[v.ID] {
 			// 最新的一批：时序路已经保证它们的曝光，语义位留给别的。
+			continue
+		}
+		if exposed != nil && exposed[v.ID] {
+			// 曝光过滤集合：用户近期已经看过的视频，防止跨页重复推荐。
 			continue
 		}
 		if f.candidateFilter != nil && !f.candidateFilter(ctx, viewerAccountID, v) {
