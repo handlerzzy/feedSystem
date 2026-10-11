@@ -3,6 +3,11 @@ backend/.run/
 data/
 .sisyphus/
 docs/
+AGENTS.md
+.scratch/
+GLOSSARY.md
+GLOSSARY-MAP.md
+
 
 # 个人开发/学习材料：只留本地，不入库
 简历项目描述.md

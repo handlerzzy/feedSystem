@@ -370,3 +370,33 @@ func (lr *LikeRepository) RecentLikedVideoIDs(ctx context.Context, accountID uin
 	}
 	return ids, nil
 }
+
+// LoadRecentVectors 从底层持久化仓储中加载最近发布的 limit 条有效向量，用于服务启动预热 VectorPool。
+func (vr *VideoRepository) LoadRecentVectors(ctx context.Context, model string, dim int, limit int) ([]VectorItem, error) {
+	candidates, err := vr.ListVectorCandidates(ctx, model, dim, limit)
+	if err != nil || len(candidates) == 0 {
+		return nil, err
+	}
+	ids := make([]uint, 0, len(candidates))
+	timeMap := make(map[uint]time.Time, len(candidates))
+	for _, c := range candidates {
+		ids = append(ids, c.ID)
+		timeMap[c.ID] = c.CreateTime
+	}
+	vectors, err := vr.LoadVectors(ctx, ids, model, dim)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VectorItem, 0, len(vectors))
+	for _, id := range ids {
+		if vec, ok := vectors[id]; ok {
+			out = append(out, VectorItem{
+				VideoID:    id,
+				CreateTime: timeMap[id],
+				Vector:     vec,
+			})
+		}
+	}
+	return out, nil
+}
+
