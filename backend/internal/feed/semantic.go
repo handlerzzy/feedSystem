@@ -82,7 +82,7 @@ type SemanticHit struct {
 // （那只是热榜的另一种算法）。未登录用户退回原有的时序/热榜排序，
 // 正是 P2 §4.5 对"新用户"的要求。
 func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, quota QuotaPlan) []SemanticHit {
-	if f.vectorStore == nil || quota.Semantic <= 0 || viewerAccountID == 0 {
+	if f.vectorStore == nil || f.vectorPool == nil || f.vectorPool.Len() == 0 || quota.Semantic <= 0 || viewerAccountID == 0 {
 		return nil
 	}
 	// 整段共用一个预算：向量读取与相似度计算都在这条路径上，
@@ -90,33 +90,7 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 	opCtx, cancel := context.WithTimeout(ctx, f.semanticTimeout)
 	defer cancel()
 
-	// 1. 候选池：最近的、有向量的视频。
-	//
-	// 模型名走 effectiveModel：库里实际存的是哪个空间由**提供方**决定
-	// （离线演示时是 faux-lexical），按配置名去读会一条都读不到。
-	model := f.effectiveModel(opCtx)
-	candidates, err := f.vectorStore.ListVectorCandidates(opCtx, model, f.embeddingDim, SemanticCandidateWindow)
-	if err != nil {
-		f.logSemanticDegrade(ctx, "列出向量候选失败，语义路本次关闭", err)
-		return nil
-	}
-	if len(candidates) == 0 {
-		// 池子为空有两种可能：回填还没跑（正常），或者库里的向量空间刚变了
-		// 而我们还在用旧名字读（换模型后的回填刚写完）。第二种只需清一次
-		// 缓存就能自愈，因此这里主动失效并**再试一次**——
-		// 不重试的话语义路会一直瞎到缓存 TTL 结束，表现为
-		// "换完模型要等半分钟才好"，而没人会想到那是缓存。
-		f.invalidateEffectiveModel()
-		model = f.effectiveModel(opCtx)
-		candidates, err = f.vectorStore.ListVectorCandidates(opCtx, model, f.embeddingDim, SemanticCandidateWindow)
-		if err != nil || len(candidates) == 0 {
-			// 仍然是空：这是**正常状态**（回填还没跑、或 AI 刚打开）。
-			// 不记日志：它会每秒钟重复一次，把真正的故障淹掉。
-			return nil
-		}
-	}
-
-	// 2. 用户兴趣向量：最近点赞视频向量的加权平均。
+	// 1. 用户兴趣向量：最近点赞视频向量的加权平均。
 	profile, err := f.userInterestVector(opCtx, viewerAccountID)
 	if err != nil {
 		f.logSemanticDegrade(ctx, "构建用户兴趣向量失败，语义路本次关闭", err)
@@ -128,39 +102,24 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 		return nil
 	}
 
-	// 3. 批量读取候选向量。
-	ids := make([]uint, 0, len(candidates))
-	byID := make(map[uint]video.VectorCandidate, len(candidates))
-	for _, c := range candidates {
-		ids = append(ids, c.ID)
-		byID[c.ID] = c
-	}
-	vectors, err := f.vectorStore.LoadVectors(opCtx, ids, model, f.embeddingDim)
-	if err != nil {
-		f.logSemanticDegrade(ctx, "读取候选向量失败，语义路本次关闭", err)
-		return nil
-	}
-	if len(vectors) == 0 {
-		return nil
-	}
+	// 2. 内存向量池余弦相似度打分与 Top-K 截取（纯内存计算，耗时 <2ms）。
+	// 在检索前获取最新一批视频 ID 集合用于前置排除（让位给时序路）。
+	excluded := f.warmupExclusionSet(opCtx)
 
-	// 4. 相似度打分。
-	scored := make([]scoredCandidate, 0, len(vectors))
-	for id, vec := range vectors {
-		if c, ok := byID[id]; ok {
-			scored = append(scored, scoredCandidate{id: id, createdAt: c.CreateTime, score: cosine(profile, vec)})
+	scored := f.vectorPool.SearchCosine(profile, SemanticMaxCandidates, func(item video.VectorItem) bool {
+		if excluded != nil && excluded[item.VideoID] {
+			return false
 		}
+		return true
+	})
+	if len(scored) == 0 {
+		return nil
 	}
-	sortCandidates(scored)
 
-	if len(scored) > SemanticMaxCandidates {
-		scored = scored[:SemanticMaxCandidates]
-	}
-
-	// 5. 取回完整视频对象（过滤与去重需要它）。
+	// 3. 取回完整视频对象（过滤与去重需要它）。
 	topIDs := make([]uint, 0, len(scored))
 	for _, s := range scored {
-		topIDs = append(topIDs, s.id)
+		topIDs = append(topIDs, s.Item.VideoID)
 	}
 	videos, err := f.repo.GetByIDs(ctx, topIDs)
 	if err != nil {
@@ -172,24 +131,26 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 		videoByID[v.ID] = v
 	}
 
-	// 6. 过滤：无效 ID、缺失视频、作者自看。顺序保持打分顺序。
-	excluded := f.warmupExclusionSet(opCtx)
+	// 4. 过滤：无效 ID、缺失视频、作者自看等。顺序保持打分顺序。
 	hits := make([]SemanticHit, 0, len(scored))
 	for _, s := range scored {
-		v := videoByID[s.id]
+		v := videoByID[s.Item.VideoID]
 		if v == nil {
-			// 向量表里有、视频表里没有：说明这条视频已被删除（或向量行是
+			// 向量池里有、视频表里没有：说明这条视频已被删除（或向量行是
 			// 孤儿）。P2 §4.2 的验收项"召回结果中不出现无效 ID"就是这一条。
 			continue
 		}
-		if excluded[v.ID] {
+		if excluded != nil && excluded[v.ID] {
 			// 最新的一批：时序路已经保证它们的曝光，语义位留给别的。
 			continue
 		}
 		if f.candidateFilter != nil && !f.candidateFilter(ctx, viewerAccountID, v) {
 			continue
 		}
-		hits = append(hits, SemanticHit{Video: v, Score: s.score})
+		hits = append(hits, SemanticHit{Video: v, Score: s.Score})
+	}
+	if len(hits) == 0 {
+		return nil
 	}
 	return hits
 }
@@ -253,6 +214,9 @@ func (f *FeedService) warmupExclusionSet(ctx context.Context) map[uint]bool {
 //
 // 返回零长切片表示"没有可用的兴趣向量"（没有点赞、或点赞的视频都没有向量）。
 func (f *FeedService) userInterestVector(ctx context.Context, accountID uint) ([]float32, error) {
+	if f.vectorStore == nil {
+		return nil, nil
+	}
 	likedIDs, err := f.vectorStore.RecentLikedVideoIDs(ctx, accountID, UserProfileLikes)
 	if err != nil {
 		return nil, err
@@ -260,10 +224,34 @@ func (f *FeedService) userInterestVector(ctx context.Context, accountID uint) ([
 	if len(likedIDs) == 0 {
 		return nil, nil
 	}
-	vectors, err := f.vectorStore.LoadVectors(ctx, likedIDs, f.effectiveModel(ctx), f.embeddingDim)
-	if err != nil {
-		return nil, err
+
+	dim := f.embeddingDim
+	vectors := make(map[uint][]float32, len(likedIDs))
+	var missingIDs []uint
+
+	// 优先在常驻内存向量池中命中点赞视频的向量（零 IO），仅当内存池未命中时才回退查库
+	for _, id := range likedIDs {
+		if f.vectorPool != nil {
+			if item, ok := f.vectorPool.Get(id); ok && len(item.Vector) == dim {
+				vectors[id] = item.Vector
+				continue
+			}
+		}
+		missingIDs = append(missingIDs, id)
 	}
+
+	if len(missingIDs) > 0 && f.vectorStore != nil {
+		loaded, err := f.vectorStore.LoadVectors(ctx, missingIDs, f.effectiveModel(ctx), dim)
+		if err != nil {
+			return nil, err
+		}
+		for id, vec := range loaded {
+			if len(vec) == dim {
+				vectors[id] = vec
+			}
+		}
+	}
+
 	if len(vectors) == 0 {
 		// 点赞过的视频还没有向量（回填没跑到）：语义路无信号。
 		return nil, nil
@@ -271,7 +259,6 @@ func (f *FeedService) userInterestVector(ctx context.Context, accountID uint) ([
 
 	// 维度在累加前定死：不同维度的向量相加会在 Go 里 panic
 	// （索引越界），而"少数几条维度不对"是完全可能的历史数据。
-	dim := f.embeddingDim
 	acc := make([]float64, dim)
 	var total float64
 	for rank, id := range likedIDs {

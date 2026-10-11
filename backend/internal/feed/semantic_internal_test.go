@@ -63,13 +63,35 @@ func newSemanticService(t *testing.T, store VectorRecallStore, quota float64) (*
 	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 
+	pool := video.NewVectorPool(100, 2)
+	if fv, ok := store.(*fakeVectorStore); ok && fv != nil {
+		if len(fv.candidates) > 0 && len(fv.vectors) > 0 {
+			items := make([]video.VectorItem, 0, len(fv.candidates))
+			for _, c := range fv.candidates {
+				if vec, ok := fv.vectors[c.ID]; ok {
+					createTime := c.CreateTime
+					if createTime.IsZero() {
+						createTime = time.UnixMilli(int64(c.ID) * 1000)
+					}
+					items = append(items, video.VectorItem{
+						VideoID:    c.ID,
+						CreateTime: createTime,
+						Vector:     vec,
+					})
+				}
+			}
+			pool.PutBatch(items)
+		}
+	}
+
 	svc := NewFeedService(repo, likes, rediscache.NewClient(rdb, "p2test:"))
 	if quota > 0 {
 		svc.WithSemanticRecall(SemanticRecallOptions{
-			Store: store,
-			Model: "test-model",
-			Dim:   2,
-			Quota: quota,
+			Store:      store,
+			VectorPool: pool,
+			Model:      "test-model",
+			Dim:        2,
+			Quota:      quota,
 		})
 	}
 	return svc, repo
@@ -473,47 +495,187 @@ func TestEffectiveModelFallsBackToConfigured(t *testing.T) {
 	}
 }
 
-// TestSemanticRecallReResolvesModelAfterSpaceChange 守"换模型后自愈"。
-//
-// 场景：库里的向量空间从 test-model 换成 faux-lexical（换 provider 或
-// 换模型后重跑回填）。此时旧名字读不到任何候选，语义路必须先失效缓存
-// 再试一次——否则它会一直瞎到缓存 TTL 结束，表现为"换完模型要等半分钟"。
-func TestSemanticRecallReResolvesModelAfterSpaceChange(t *testing.T) {
+// ---------- Ticket 03: 内存向量池余弦召回与零 MySQL 候选 IO 断言 ----------
+
+// TestSemanticRecallPureInMemoryZeroMySQLCandidatesIO 守"读链路零 MySQL 候选查询与 500 BLOB 切断"（Ticket 03 核心红线）。
+func TestSemanticRecallPureInMemoryZeroMySQLCandidatesIO(t *testing.T) {
 	store := &fakeVectorStore{
-		liked:   []uint{40},
-		vectors: map[uint][]float32{40: {1, 0}, 41: {1, 0}},
-		// 旧空间下没有任何候选；新空间下有 41。
-		candidates2: []video.VectorCandidate{{ID: 41}},
-		// 第一次解析看到的是已过期的旧空间，之后变成新空间。
-		modelsByCall: [][]video.EmbeddingModelStat{
-			{{Model: "stale-lexical", Dim: 2, Rows: 1}},
-			{{Model: "test-model", Dim: 2, Rows: 1}},
+		liked: []uint{40},
+		vectors: map[uint][]float32{
+			40: {1, 0},
+			50: {0.8, 0.6},
+		},
+		candidates: []video.VectorCandidate{
+			{ID: 40},
+			{ID: 50},
 		},
 	}
 	svc, repo := newSemanticService(t, store, 0.5)
-	repo.existing = map[uint]bool{41: true}
+	repo.existing = map[uint]bool{40: true, 50: true}
 
-	hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 1})
-	if len(hits) == 0 {
-		t.Fatal("换向量空间后语义路没有自愈：仍然按旧模型名读，一条都读不到")
+	// 执行语义召回
+	hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 2})
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits, got %d", len(hits))
 	}
-	if hits[0].Video.ID != 41 {
-		t.Fatalf("召回结果 = %d, want 41", hits[0].Video.ID)
+	if hits[0].Video.ID != 40 || hits[1].Video.ID != 50 {
+		t.Fatalf("unexpected hits order: %v, %v", hits[0].Video.ID, hits[1].Video.ID)
+	}
+
+	// 核心断言：读路径绝对不得向数据库发起 ListVectorCandidates（零 MySQL 候选 IO）
+	if store.candidateCalls != 0 {
+		t.Fatalf("读链路违规向数据库发起了 %d 次候选查询（应当完全基于堆内 VectorPool 纯内存打分）", store.candidateCalls)
 	}
 }
 
-// TestSemanticRecallInvalidatesModelCacheOnEmpty 守"缓存会被主动失效"。
-func TestSemanticRecallInvalidatesModelCacheOnEmpty(t *testing.T) {
+// TestUserInterestVectorPullsFromVectorPoolFirst 验证点赞向量优先命中内存向量池（零 MySQL IO），未命中时仅按需读取缺失向量。
+func TestUserInterestVectorPullsFromVectorPoolFirst(t *testing.T) {
+	pool := video.NewVectorPool(10, 2)
+	now := time.Now()
+	// 视频 1 在内存池中
+	_, err := pool.Put(video.VectorItem{
+		VideoID:    1,
+		CreateTime: now,
+		Vector:     []float32{1, 0},
+	})
+	if err != nil {
+		t.Fatalf("pool.Put failed: %v", err)
+	}
+
+	loadVectorsCalls := 0
+	var requestedIDs []uint
+	store := &fakeVectorStore{
+		liked: []uint{1, 2}, // 用户点赞了 1 和 2
+	}
+	store.vectors = map[uint][]float32{
+		2: {0, 1}, // 视频 2 需从仓储补查
+	}
+
+	repo := &fakeFeedStore{}
+	likes := &fakeLikeLookup{}
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("start miniredis: %v", err)
+	}
+	t.Cleanup(mr.Close)
+	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	svc := NewFeedService(repo, likes, rediscache.NewClient(rdb, "p2test:")).
+		WithSemanticRecall(SemanticRecallOptions{
+			Store:      store,
+			VectorPool: pool,
+			Model:      "test-model",
+			Dim:        2,
+			Quota:      0.5,
+		})
+
+	// 劫持 LoadVectors 统计实际发往仓储的请求 ID
+	customStore := &loadTrackingVectorStore{
+		fakeVectorStore: store,
+		onLoadVectors: func(ids []uint) {
+			loadVectorsCalls++
+			requestedIDs = append(requestedIDs, ids...)
+		},
+	}
+	svc.vectorStore = customStore
+
+	profile, err := svc.userInterestVector(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("userInterestVector failed: %v", err)
+	}
+	if len(profile) != 2 {
+		t.Fatalf("expected profile dim 2, got %d", len(profile))
+	}
+
+	// 视频 1 已在内存池，因此 LoadVectors 只应当请求视频 2
+	if loadVectorsCalls != 1 {
+		t.Fatalf("expected 1 LoadVectors call, got %d", loadVectorsCalls)
+	}
+	if len(requestedIDs) != 1 || requestedIDs[0] != 2 {
+		t.Fatalf("expected LoadVectors for only missing ID [2], got %v", requestedIDs)
+	}
+}
+
+type loadTrackingVectorStore struct {
+	*fakeVectorStore
+	onLoadVectors func(ids []uint)
+}
+
+func (l *loadTrackingVectorStore) LoadVectors(ctx context.Context, ids []uint, model string, dim int) (map[uint][]float32, error) {
+	if l.onLoadVectors != nil {
+		l.onLoadVectors(ids)
+	}
+	return l.fakeVectorStore.LoadVectors(ctx, ids, model, dim)
+}
+
+// TestSemanticRecallLatencyUnder2ms 验证 2,000 条活跃视频内存候选池上的打分耗时低于 2ms（Ticket 03 AC 3）。
+func TestSemanticRecallLatencyUnder2ms(t *testing.T) {
+	const (
+		capacity = 2000
+		dim      = 1536
+	)
+	pool := video.NewVectorPool(capacity, dim)
+	baseTime := time.Now()
+
+	batch := make([]video.VectorItem, capacity)
+	for i := 0; i < capacity; i++ {
+		vec := make([]float32, dim)
+		vec[0] = float32(i + 1)
+		batch[i] = video.VectorItem{
+			VideoID:    uint(i + 1),
+			CreateTime: baseTime.Add(time.Duration(i) * time.Second),
+			Vector:     vec,
+		}
+	}
+	pool.PutBatch(batch)
+
+	query := make([]float32, dim)
+	query[0] = 1.0
+
+	// 预热单次
+	_ = pool.SearchCosine(query, 50, nil)
+
+	// 测量 50 次调用的单次耗时均值
+	start := time.Now()
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		res := pool.SearchCosine(query, 50, nil)
+		if len(res) != 50 {
+			t.Fatalf("expected 50 scored items, got %d", len(res))
+		}
+	}
+	totalElapsed := time.Since(start)
+	avgLatency := totalElapsed / iterations
+
+	maxAllowed := 2 * time.Millisecond
+	if raceEnabled {
+		maxAllowed = 50 * time.Millisecond
+	}
+	if avgLatency > maxAllowed {
+		t.Fatalf("2,000 候选余弦检索平均耗时 %v 超出性能红线 %v", avgLatency, maxAllowed)
+	}
+}
+
+// TestSemanticRecallColdStartAndDegradation 验证未登录、无点赞或空向量池时静默返回 nil（Ticket 03 AC 4）。
+func TestSemanticRecallColdStartAndDegradation(t *testing.T) {
 	store := &fakeVectorStore{}
 	svc, _ := newSemanticService(t, store, 0.5)
-	svc.effectiveModel(context.Background())
-	if store.modelCalls != 1 {
-		t.Fatalf("modelCalls = %d, want 1", store.modelCalls)
+
+	// 1. 未登录用户
+	if hits := svc.semanticRecall(context.Background(), 0, QuotaPlan{Semantic: 2}); hits != nil {
+		t.Fatalf("expected nil for anonymous viewer, got %v", hits)
 	}
-	svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 1})
-	if store.modelCalls < 2 {
-		t.Fatalf("读到 0 条候选后没有重新解析模型名（modelCalls=%d）：换模型后要等缓存过期才好",
-			store.modelCalls)
+
+	// 2. 无点赞用户
+	if hits := svc.semanticRecall(context.Background(), 999, QuotaPlan{Semantic: 2}); hits != nil {
+		t.Fatalf("expected nil for user without likes, got %v", hits)
+	}
+
+	// 3. 空向量池
+	svc.WithVectorPool(video.NewVectorPool(10, 2))
+	if hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 2}); hits != nil {
+		t.Fatalf("expected nil for empty vector pool, got %v", hits)
 	}
 }
 

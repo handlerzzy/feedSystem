@@ -159,14 +159,15 @@ func SetRouter(deps Deps) *gin.Engine {
 	} else {
 		videoService.WithContentAnalysis(mq)
 	}
-	// P2 视频发布即时向量化触发器：发布成功后异步触发单条视频的向量生成与落库，并增量同步至堆内向量池。
+	// P2 视频发布即时向量化触发器与常驻内存向量池：堆内存中维护最近 2,000 条活跃视频向量，为读链路与发布即时触发提供零 IO 数据源。
+	var vectorPool *video.VectorPool
 	if cfg.AI.Enabled && embedReason == nil {
 		backfillOpts := video.DefaultBackfillOptions()
 		backfillOpts.Model = cfg.AI.EmbeddingModelOr()
 		backfillOpts.Dim = cfg.AI.EmbeddingDimOr()
 		normalize := true
 		backfillOpts.Normalize = &normalize
-		vectorPool := video.NewVectorPool(video.DefaultVectorPoolCapacity, backfillOpts.Dim)
+		vectorPool = video.NewVectorPool(video.DefaultVectorPoolCapacity, backfillOpts.Dim)
 		if warmed, err := videoRepository.LoadRecentVectors(context.Background(), backfillOpts.Model, backfillOpts.Dim, video.DefaultVectorPoolCapacity); err == nil && len(warmed) > 0 {
 			vectorPool.PutBatch(warmed)
 		}
@@ -272,10 +273,11 @@ func SetRouter(deps Deps) *gin.Engine {
 	exploreQuota := cfg.AI.ExploreQuotaOr()
 	if cfg.AI.Enabled && (recallQuota > 0 || exploreQuota > 0) {
 		feedService.WithSemanticRecall(feed.SemanticRecallOptions{
-			Store: &feedSemanticStore{videos: videoRepository, likes: likeRepository},
-			Model: cfg.AI.EmbeddingModelOr(),
-			Dim:   cfg.AI.EmbeddingDimOr(),
-			Quota: recallQuota,
+			Store:      &feedSemanticStore{videos: videoRepository, likes: likeRepository},
+			VectorPool: vectorPool,
+			Model:      cfg.AI.EmbeddingModelOr(),
+			Dim:        cfg.AI.EmbeddingDimOr(),
+			Quota:      recallQuota,
 			Addons: feed.SemanticAddons{
 				ExploreQuota: exploreQuota,
 			},

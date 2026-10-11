@@ -42,6 +42,8 @@ type FeedService struct {
 	// "AI 关闭 / 没配向量"是最常见的部署形态，它应当在装配层表现为
 	// "不调用 WithSemanticRecall"，而不是每个请求里多一次 nil 判断。
 	vectorStore VectorRecallStore
+	// vectorPool 是常驻 Go 进程堆内存的向量缓存池，为读链路提供零 IO 候选源。
+	vectorPool *video.VectorPool
 	// recallQuota / exploreQuota 是两路配额（0 = 关闭）。
 	recallQuota  float64
 	exploreQuota float64
@@ -133,11 +135,12 @@ func (f *FeedService) WithSummaryLookup(l SummaryLookup) *FeedService {
 // "配额开着但没有向量模型"这种半开状态——而它的现象是
 // 语义路静默地永远返回空，排查起来只能靠读代码。
 type SemanticRecallOptions struct {
-	Store  VectorRecallStore
-	Model  string
-	Dim    int
-	Quota  float64
-	Addons SemanticAddons
+	Store      VectorRecallStore
+	VectorPool *video.VectorPool
+	Model      string
+	Dim        int
+	Quota      float64
+	Addons     SemanticAddons
 }
 
 // SemanticAddons 是语义路的两项可选扩展。
@@ -160,6 +163,17 @@ type SemanticAddons struct {
 // 总耗时就是三段之和，而预算的本意是给用户请求设一个上界。
 const DefaultSemanticTimeout = 50 * time.Millisecond
 
+// WithVectorPool 显式注入常驻内存向量池，返回自身以支持链式装配。
+func (f *FeedService) WithVectorPool(p *video.VectorPool) *FeedService {
+	f.vectorPool = p
+	return f
+}
+
+// VectorPool 返回当前配置的内存向量池（可能为 nil）。
+func (f *FeedService) VectorPool() *video.VectorPool {
+	return f.vectorPool
+}
+
 // WithSemanticRecall 注入 P2 的语义召回能力，返回自身以支持链式装配。
 //
 // 装配层只在"AI 打开且配额 > 0"时调用它。不调用时：
@@ -174,6 +188,11 @@ func (f *FeedService) WithSemanticRecall(opts SemanticRecallOptions) *FeedServic
 		// 维度是幂等键的一部分，不能靠"猜"。给一个与 ai 默认值一致的值，
 		// 让直接构造 options 的调用方仍然能工作（真正的取值由装配层给）。
 		f.embeddingDim = defaultEmbeddingDim
+	}
+	if opts.VectorPool != nil {
+		f.vectorPool = opts.VectorPool
+	} else if f.vectorPool == nil {
+		f.vectorPool = video.NewVectorPool(video.DefaultVectorPoolCapacity, f.embeddingDim)
 	}
 	if opts.Store == nil {
 		// Store 为空等于这条路不存在。把配额一并清零，
