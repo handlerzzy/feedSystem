@@ -51,6 +51,12 @@ type FreshIDLister interface {
 	NewestVideoIDs(ctx context.Context, limit int) ([]uint, error)
 }
 
+// LongTailTagLister 是按标签检索历史长尾视频（避开内存活跃池）的可选能力。
+// 当仓储实现此接口时，长尾粗筛能够下潜更深的时间窗口，检索出真正的非活跃历史视频。
+type LongTailTagLister interface {
+	ListLongTailByTag(ctx context.Context, tagName string, limit int, excludeIDs []uint) ([]*video.Video, error)
+}
+
 // VectorRecallStore 是 P2 语义召回所需的向量能力（**可选**接口）。
 //
 // 为什么单独一个接口、而不是往 FeedStore 上加方法：
@@ -128,8 +134,10 @@ type ReasonSignalLookup interface {
 // 若 FeedRepository / video.LikeRepository 的方法签名漂移，这里会立刻编译失败，
 // 而不是等到某个测试莫名其妙地报错。
 var (
-	_ FeedStore  = (*FeedRepository)(nil)
-	_ LikeLookup = (*video.LikeRepository)(nil)
+	_ FeedStore          = (*FeedRepository)(nil)
+	_ ReasonSignalLookup = (*FeedRepository)(nil)
+	_ LongTailTagLister  = (*FeedRepository)(nil)
+	_ LikeLookup         = (*video.LikeRepository)(nil)
 	// SummaryLookup 由 video 包实现（表的所有者是它），接口声明在消费方。
 	_ SummaryLookup = (*video.VideoRepository)(nil)
 )

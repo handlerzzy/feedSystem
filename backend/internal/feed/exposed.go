@@ -2,7 +2,6 @@ package feed
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"time"
 
@@ -13,11 +12,6 @@ import (
 
 // DefaultExposedFilterTTL 是用户曝光过滤集合的默认滑动窗口过期时间（15~30 分钟，依 Spec §4.3 取 30 分钟）。
 const DefaultExposedFilterTTL = 30 * time.Minute
-
-// exposedKey 返回 Redis 中用户曝光集合的 Key 模式（feed:exposed:{account_id}）。
-func exposedKey(accountID uint) string {
-	return fmt.Sprintf("feed:exposed:%d", accountID)
-}
 
 // WithExposedFilterTTL 设置曝光过滤集合的滑动 TTL。
 func (f *FeedService) WithExposedFilterTTL(ttl time.Duration) *FeedService {

@@ -99,6 +99,27 @@ func TestVectorPool_Put_ValidationAndGet(t *testing.T) {
 	}
 }
 
+func TestVectorPool_VideoIDs(t *testing.T) {
+	pool := NewVectorPool(5, 2)
+	if ids := pool.VideoIDs(); len(ids) != 0 {
+		t.Fatalf("expected empty ids for empty pool, got %v", ids)
+	}
+
+	pool.PutBatch([]VectorItem{
+		{VideoID: 10, CreateTime: time.Now(), Vector: []float32{1, 0}},
+		{VideoID: 20, CreateTime: time.Now(), Vector: []float32{0, 1}},
+	})
+
+	ids := pool.VideoIDs()
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 ids, got %d", len(ids))
+	}
+	idMap := map[uint]bool{ids[0]: true, ids[1]: true}
+	if !idMap[10] || !idMap[20] {
+		t.Errorf("expected IDs 10 and 20 in pool.VideoIDs(), got %v", ids)
+	}
+}
+
 func TestVectorPool_CapacityAndEviction(t *testing.T) {
 	pool := NewVectorPool(3, 4)
 	baseTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -240,9 +261,9 @@ func TestVectorPool_SearchCosine(t *testing.T) {
 	query := []float32{1, 0, 0, 0}
 	hits := pool.SearchCosine(query, 10, nil)
 
-	// 相似度 > 0 的应有 ID 1 (1.0) 和 ID 2 (约 0.707)，ID 3 垂直 (dot=0) 过滤掉
-	if len(hits) != 2 {
-		t.Fatalf("expected 2 hits with positive cosine, got %d", len(hits))
+	// 非正相关向量（如 ID 3 垂直 dot=0）不应被丢弃，全量参与 Top-K 排序
+	if len(hits) != 3 {
+		t.Fatalf("expected 3 hits including zero-dot vector, got %d", len(hits))
 	}
 
 	if hits[0].Item.VideoID != 1 {
@@ -259,17 +280,131 @@ func TestVectorPool_SearchCosine(t *testing.T) {
 		t.Errorf("expected score ~0.7071, got %f", hits[1].Score)
 	}
 
+	if hits[2].Item.VideoID != 3 {
+		t.Errorf("expected third hit VideoID 3 (orthogonal dot=0), got %d", hits[2].Item.VideoID)
+	}
+	if math.Abs(hits[2].Score-0.0) > 1e-4 {
+		t.Errorf("expected score ~0.0 for orthogonal vector, got %f", hits[2].Score)
+	}
+
 	// 测试 filter 过滤回调（如排除 ID 1）
 	filteredHits := pool.SearchCosine(query, 10, func(item VectorItem) bool {
 		return item.VideoID != 1
 	})
-	if len(filteredHits) != 1 || filteredHits[0].Item.VideoID != 2 {
-		t.Fatalf("expected filtered hits only contain ID 2, got %v", filteredHits)
+	if len(filteredHits) != 2 || filteredHits[0].Item.VideoID != 2 || filteredHits[1].Item.VideoID != 3 {
+		t.Fatalf("expected filtered hits contain ID 2 and ID 3, got %v", filteredHits)
 	}
 
 	// 测试空池或维度不匹配时安全返回空
 	if len(pool.SearchCosine([]float32{1, 0}, 10, nil)) != 0 {
 		t.Errorf("expected empty hits for dim mismatch")
+	}
+}
+
+func TestVectorPool_SearchCosineAllowsNonPositiveAndHandlesNaN(t *testing.T) {
+	pool := NewVectorPool(10, 2)
+	baseTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+
+	// ID 1: [1, 0] (与 [1, 0] 点积 1.0)
+	// ID 2: [0, 1] (与 [1, 0] 点积 0.0，正交)
+	// ID 3: [-1, 0] (与 [1, 0] 点积 -1.0，相反)
+	// ID 4: [NaN, 0] (点积产生 NaN，应被过滤)
+	pool.PutBatch([]VectorItem{
+		{VideoID: 1, CreateTime: baseTime, Vector: []float32{1, 0}},
+		{VideoID: 2, CreateTime: baseTime.Add(1 * time.Hour), Vector: []float32{0, 1}},
+		{VideoID: 3, CreateTime: baseTime.Add(2 * time.Hour), Vector: []float32{-1, 0}},
+		{VideoID: 4, CreateTime: baseTime.Add(3 * time.Hour), Vector: []float32{float32(math.NaN()), 0}},
+	})
+
+	hits := pool.SearchCosine([]float32{1, 0}, 10, nil)
+	if len(hits) != 3 {
+		t.Fatalf("expected 3 hits (excluding NaN), got %d: %v", len(hits), hits)
+	}
+
+	// 降序排序验证：1.0 > 0.0 > -1.0
+	expectedIDs := []uint{1, 2, 3}
+	expectedScores := []float64{1.0, 0.0, -1.0}
+	for i, wantID := range expectedIDs {
+		if hits[i].Item.VideoID != wantID {
+			t.Errorf("hit[%d] VideoID = %d, want %d", i, hits[i].Item.VideoID, wantID)
+		}
+		if math.Abs(hits[i].Score-expectedScores[i]) > 1e-4 {
+			t.Errorf("hit[%d] Score = %f, want %f", i, hits[i].Score, expectedScores[i])
+		}
+	}
+}
+
+func TestCompareScoredVectorItem(t *testing.T) {
+	baseTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	// 分数不同：分数高排在前面（返回 -1）
+	a := ScoredVectorItem{Item: VectorItem{VideoID: 1, CreateTime: baseTime}, Score: 0.9}
+	b := ScoredVectorItem{Item: VectorItem{VideoID: 2, CreateTime: baseTime}, Score: 0.8}
+	if cmp := compareScoredVectorItem(a, b); cmp != -1 {
+		t.Errorf("expected a > b (-1), got %d", cmp)
+	}
+	if cmp := compareScoredVectorItem(b, a); cmp != 1 {
+		t.Errorf("expected b < a (1), got %d", cmp)
+	}
+
+	// 分数相同，时间较新排前面
+	c := ScoredVectorItem{Item: VectorItem{VideoID: 3, CreateTime: baseTime.Add(time.Hour)}, Score: 0.9}
+	if cmp := compareScoredVectorItem(c, a); cmp != -1 {
+		t.Errorf("expected c > a (-1) due to newer time, got %d", cmp)
+	}
+
+	// 分数与时间相同，ID 较大排前面
+	d := ScoredVectorItem{Item: VectorItem{VideoID: 10, CreateTime: baseTime}, Score: 0.9}
+	if cmp := compareScoredVectorItem(d, a); cmp != -1 {
+		t.Errorf("expected d > a (-1) due to higher video ID, got %d", cmp)
+	}
+
+	// 完全相同
+	if cmp := compareScoredVectorItem(a, a); cmp != 0 {
+		t.Errorf("expected a == a (0), got %d", cmp)
+	}
+}
+
+func TestVectorPool_SearchCosineWithExtra(t *testing.T) {
+	pool := NewVectorPool(10, 4)
+	baseTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+
+	// 内存池有 ID 1 (点积 0.5) 和 ID 2 (点积 0.6)
+	items := []VectorItem{
+		{VideoID: 1, CreateTime: baseTime, Vector: []float32{1, 1, 1, 1}},
+		{VideoID: 2, CreateTime: baseTime.Add(1 * time.Hour), Vector: []float32{1, 1, 0, 0}},
+	}
+	pool.PutBatch(items)
+
+	// 长尾额外候选有：
+	// ID 100: 与 query [1,0,0,0] 夹角为 0，相似度 1.0 (超过内存池中所有候选)
+	// ID 1: 重复项，应该被自动去重，保留一份
+	extra := []VectorItem{
+		{VideoID: 100, CreateTime: baseTime.Add(-100 * time.Hour), Vector: []float32{1, 0, 0, 0}},
+		{VideoID: 1, CreateTime: baseTime, Vector: []float32{1, 1, 1, 1}},
+	}
+
+	query := []float32{1, 0, 0, 0}
+	hits := pool.SearchCosineWithExtra(query, extra, 10, nil)
+
+	// 结果应包含 ID 100 (1.0), ID 2 (0.7071), ID 1 (0.5)，去重后共 3 条
+	if len(hits) != 3 {
+		t.Fatalf("expected 3 unique hits, got %d: %v", len(hits), hits)
+	}
+
+	if hits[0].Item.VideoID != 100 {
+		t.Errorf("expected top hit VideoID 100 (long tail winner), got %d", hits[0].Item.VideoID)
+	}
+	if math.Abs(hits[0].Score-1.0) > 1e-4 {
+		t.Errorf("expected score ~1.0 for ID 100, got %f", hits[0].Score)
+	}
+
+	// 验证 ID 没有重复
+	seen := make(map[uint]bool)
+	for _, h := range hits {
+		if seen[h.Item.VideoID] {
+			t.Errorf("duplicate hit in SearchCosineWithExtra: %d", h.Item.VideoID)
+		}
+		seen[h.Item.VideoID] = true
 	}
 }
 

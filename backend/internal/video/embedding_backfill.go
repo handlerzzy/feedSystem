@@ -270,10 +270,11 @@ func (b *EmbeddingBackfiller) BackfillOnce(ctx context.Context) (BackfillStats, 
 			end = len(stale)
 		}
 		batch := stale[start:end]
-		e, s, f, _ := b.embedBatch(ctx, batch)
-		stats.Embedded += e
-		stats.Skipped += s
-		stats.Failed += f
+		embedded, skipped, failed, err := b.embedBatch(ctx, batch)
+		_ = err
+		stats.Embedded += embedded
+		stats.Skipped += skipped
+		stats.Failed += failed
 	}
 
 	// 仍然需要向量化的条数：本次扫描范围内没做完的部分。

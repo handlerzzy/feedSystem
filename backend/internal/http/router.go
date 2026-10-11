@@ -168,9 +168,11 @@ func SetRouter(deps Deps) *gin.Engine {
 		normalize := true
 		backfillOpts.Normalize = &normalize
 		vectorPool = video.NewVectorPool(video.DefaultVectorPoolCapacity, backfillOpts.Dim)
-		if warmed, err := videoRepository.LoadRecentVectors(context.Background(), backfillOpts.Model, backfillOpts.Dim, video.DefaultVectorPoolCapacity); err == nil && len(warmed) > 0 {
+		warmupCtx, cancelWarmup := context.WithTimeout(context.Background(), 5*time.Second)
+		if warmed, err := videoRepository.LoadRecentVectors(warmupCtx, backfillOpts.Model, backfillOpts.Dim, video.DefaultVectorPoolCapacity); err == nil && len(warmed) > 0 {
 			vectorPool.PutBatch(warmed)
 		}
+		cancelWarmup()
 		backfiller := video.NewEmbeddingBackfiller(videoRepository, embeddingClient, backfillOpts).
 			WithVectorPool(vectorPool)
 		videoService.WithEmbeddingTrigger(backfiller)
@@ -304,7 +306,7 @@ func SetRouter(deps Deps) *gin.Engine {
 	// "ai_disabled" 降级。**不**在这里替它判断，是为了让"降级率"这个
 	// 指标反映真实的调用结果，而不是被两处判断各解释一遍。
 	if reranker, err := aiapp.RerankClient(cfg.AI, aiClient); err != nil {
-		logging.L().Warn("LLM 精排未启用（配置不完整）", zap.Error(err))
+		logging.L().Warn("专用 Rerank/Agent 基建未启用（配置不完整）", zap.Error(err))
 	} else if reranker != nil {
 		feedService.WithRerank(feed.RerankOptions{
 			Client:  reranker,
@@ -312,7 +314,7 @@ func SetRouter(deps Deps) *gin.Engine {
 			Timeout: cfg.AI.RerankTimeoutOr(),
 			TopN:    cfg.AI.RerankCandidatesOr(),
 		})
-		logging.L().Info("P2 LLM 精排已启用",
+		logging.L().Info("专用 Rerank/Agent 基建已就绪 (在线读链路采用本地轻量多特征精排)",
 			zap.Duration("timeout", cfg.AI.RerankTimeoutOr()),
 			zap.Int("candidates", cfg.AI.RerankCandidatesOr()),
 			zap.String("model", cfg.AI.Model))

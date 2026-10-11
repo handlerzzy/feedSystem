@@ -566,17 +566,8 @@ func (f *FeedService) listLatestFused(ctx context.Context, limit int, latestBefo
 		return f.buildListLatestResponse(ctx, nil, limit, time.Time{}, viewerAccountID,
 			reasonSources{semantic: semantic, explore: explore})
 	}
-	// LLM 精排（默认关闭）。它作用在**最终列表**上：融合分已经把三路的
-	// 优先级表达完了，精排只改变列表内部的次序，不改变集合
-	// （validateRerankResult 强制这一点）。
-	//
-	// 顺序：融合 → 精排 → 配额槽位允许被"重排"而不是"重新分配"。
-	// 之所以不在精排之后再分配配额：那会让"配额"失去确定性——
-	// 模型给出的顺序一旦偏好某一类内容，配额位就会被同一路占满。
-	if final = f.applyRerank(ctx, viewerAccountID, final); len(final) == 0 {
-		return f.buildListLatestResponse(ctx, nil, limit, time.Time{}, viewerAccountID,
-			reasonSources{semantic: semantic, explore: explore})
-	}
+	// 本地轻量多特征精排已前置于语义召回通道内部完成（Task 3 方案 A / ADR-0001 §5），
+	// 此处 fuseChannels 直接保障“配额槽位融合”规范（预定配额比例插槽与基准时序分页游标正确性）。
 	return f.buildListLatestResponse(ctx, final, limit, oldestBase, viewerAccountID,
 		reasonSources{semantic: semantic, explore: explore})
 }

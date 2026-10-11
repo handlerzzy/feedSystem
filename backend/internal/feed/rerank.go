@@ -21,6 +21,12 @@ import (
 
 // 本文件实现 P2 §4.4「LLM 精排」。
 //
+// 架构决策演进 (ADR-0001 §5 / Ticket 05 / Task 3)：
+// 读链路上已彻底解耦并移除了同步调用外部大模型或 Sidecar 的 rerankCandidates 伪设计。
+// 在线读请求全面收敛至 local_rerank.go 中的纯内存极速多特征重排（LocalRerankSemanticHits 前置于语义召回通道内部，耗时 <0.1ms）。
+// 本文件内的 AIModelReranker 与 rerankCandidates 仅保留作为未来专用 Rerank 模型 gRPC 基建或离线评测使用，
+// 绝不进入在线读链路，彻底消除了外部网络 RPC 对核心 Feed 流的阻塞风险。
+//
 // 一条不可协商的纪律（D1 的原文）：
 //
 //	**必须带严格超时**：超时立即退回融合分排序，绝不让用户请求等待模型。

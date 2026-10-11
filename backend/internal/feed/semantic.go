@@ -61,6 +61,13 @@ const (
 	// 太大也没有意义：真正进入最终列表的只有 recall_quota × limit 条。
 	// 留出余量是为了让融合阶段在去重（与基础页重复）之后还有得选。
 	SemanticMaxCandidates = 50
+
+	// LongTailMaxCandidates 是两级召回中长尾标签粗筛的最大候选条数（50~100 条）。
+	// 与常驻内存池的 2,000 条活跃视频合并打分，兼顾时效热度与长尾覆盖。
+	LongTailMaxCandidates = 100
+
+	// LongTailTopTags 是分析用户近期点赞偏好时提取的高频标签数量。
+	LongTailTopTags = 3
 )
 
 // SemanticHit 是一条语义召回结果。
@@ -90,25 +97,40 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 	opCtx, cancel := context.WithTimeout(ctx, f.semanticTimeout)
 	defer cancel()
 
-	// 1. 用户兴趣向量：最近点赞视频向量的加权平均。
-	profile, err := f.userInterestVector(opCtx, viewerAccountID)
+	// 1. 获取用户近期点赞的视频 ID 列表
+	likedIDs, err := f.vectorStore.RecentLikedVideoIDs(opCtx, viewerAccountID, UserProfileLikes)
 	if err != nil {
-		f.logSemanticDegrade(ctx, "构建用户兴趣向量失败，语义路本次关闭", err)
+		f.logSemanticDegrade(ctx, "读取用户点赞历史失败，语义路本次关闭", err)
 		return nil
 	}
-	if len(profile) == 0 {
+	if len(likedIDs) == 0 {
 		// 新用户 / 没有点赞：没有可用的个性化信号。这是 P2 §4.5 明确
 		// 描述的冷启动状态，退回原有排序即可，不是故障。
 		return nil
 	}
 
-	// 2. 内存向量池余弦相似度打分与 Top-K 截取（纯内存计算，耗时 <2ms）。
+	// 2. 基于点赞视频合成用户即时兴趣向量（优先命中常驻内存向量池，未命中时按需 LoadVectors）
+	profile, err := f.userInterestVectorFromLikedIDs(opCtx, likedIDs)
+	if err != nil {
+		f.logSemanticDegrade(ctx, "构建用户兴趣向量失败，语义路本次关闭", err)
+		return nil
+	}
+	if len(profile) == 0 {
+		return nil
+	}
+
+	// 3. 两级候选圈定机制 (Ticket 05 / ADR-0001 §2)：
+	// 第一级：常驻内存向量池（2,000 条活跃视频）
+	// 第二级：提取用户近期高频点赞的 Top 标签，通过已有标签倒排索引定向粗筛 50~100 条历史长尾候选并补齐向量
+	extraLongTailItems, longTailVideoMap := f.roughSelectLongTailCandidates(opCtx, likedIDs)
+
+	// 4. 纯内存余弦相似度打分与 Top-K 截取（耗时 <2ms）。
 	// 在检索前获取最新一批视频 ID 集合用于前置排除（让位给时序路），
 	// 以及获取用户近期已看视频曝光集合用于滑动过滤（消除跨页重复推荐）。
 	excluded := f.warmupExclusionSet(opCtx)
 	exposed := f.getExposedFilterSet(opCtx, viewerAccountID)
 
-	scored := f.vectorPool.SearchCosine(profile, SemanticMaxCandidates, func(item video.VectorItem) bool {
+	scored := f.vectorPool.SearchCosineWithExtra(profile, extraLongTailItems, SemanticMaxCandidates, func(item video.VectorItem) bool {
 		if excluded != nil && excluded[item.VideoID] {
 			return false
 		}
@@ -121,39 +143,38 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 		return nil
 	}
 
-	// 3. 取回完整视频对象（过滤与去重需要它）。
-	topIDs := make([]uint, 0, len(scored))
+	// 5. 取回完整视频对象（长尾已粗筛出的直接复用，其余批量 GetByIDs 查询）。
+	videoByID := make(map[uint]*video.Video, len(scored))
+	var needFetchIDs []uint
 	for _, s := range scored {
-		topIDs = append(topIDs, s.Item.VideoID)
+		id := s.Item.VideoID
+		if v, ok := longTailVideoMap[id]; ok && v != nil {
+			videoByID[id] = v
+		} else {
+			needFetchIDs = append(needFetchIDs, id)
+		}
 	}
-	videos, err := f.repo.GetByIDs(ctx, topIDs)
-	if err != nil {
-		f.logSemanticDegrade(ctx, "读取召回视频失败，语义路本次关闭", err)
-		return nil
-	}
-	videoByID := make(map[uint]*video.Video, len(videos))
-	for _, v := range videos {
-		videoByID[v.ID] = v
+	if len(needFetchIDs) > 0 {
+		videos, err := f.repo.GetByIDs(opCtx, needFetchIDs)
+		if err != nil {
+			f.logSemanticDegrade(ctx, "读取召回视频失败，语义路本次关闭", err)
+			return nil
+		}
+		for _, v := range videos {
+			videoByID[v.ID] = v
+		}
 	}
 
-	// 4. 过滤：无效 ID、缺失视频、曝光过滤、作者自看等。顺序保持打分顺序。
+	// 6. 过滤：无效 ID、缺失视频、作者自看/拉黑等业务过滤。顺序保持打分顺序。
+	// 注意：excluded（时序最新批次）与 exposed（滑动曝光集合）已在 SearchCosineWithExtra 回调中前置过滤，此处无需二次判断。
 	hits := make([]SemanticHit, 0, len(scored))
 	for _, s := range scored {
 		v := videoByID[s.Item.VideoID]
 		if v == nil {
-			// 向量池里有、视频表里没有：说明这条视频已被删除（或向量行是
-			// 孤儿）。P2 §4.2 的验收项"召回结果中不出现无效 ID"就是这一条。
+			// 向量池里有、视频表里没有：说明这条视频已被删除（或向量行是孤儿）。
 			continue
 		}
-		if excluded != nil && excluded[v.ID] {
-			// 最新的一批：时序路已经保证它们的曝光，语义位留给别的。
-			continue
-		}
-		if exposed != nil && exposed[v.ID] {
-			// 曝光过滤集合：用户近期已经看过的视频，防止跨页重复推荐。
-			continue
-		}
-		if f.candidateFilter != nil && !f.candidateFilter(ctx, viewerAccountID, v) {
+		if f.candidateFilter != nil && !f.candidateFilter(opCtx, viewerAccountID, v) {
 			continue
 		}
 		hits = append(hits, SemanticHit{Video: v, Score: s.Score})
@@ -161,6 +182,11 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 	if len(hits) == 0 {
 		return nil
 	}
+
+	// 7. 本地轻量多特征精排（ADR-0001 §5 / Task 3 方案 A）：
+	// 本地多特征精排打分前置到语义召回通道内部（对 hits 基于【语义分 + 时间指数衰减 + 互动热度】进行极速特征打分与重排），
+	// 随后输入 fuseChannels 进行交错插槽，严格捍卫配额槽位融合规范，防止全量重排导致高分语义视频集中霸屏破坏时序基准流。
+	hits = LocalRerankSemanticHits(hits, time.Now(), DefaultLocalRerankOptions())
 	return hits
 }
 
@@ -230,6 +256,11 @@ func (f *FeedService) userInterestVector(ctx context.Context, accountID uint) ([
 	if err != nil {
 		return nil, err
 	}
+	return f.userInterestVectorFromLikedIDs(ctx, likedIDs)
+}
+
+// userInterestVectorFromLikedIDs 基于给定的点赞视频 ID 列表加权平均合成用户即时兴趣向量并做 L2 归一化。
+func (f *FeedService) userInterestVectorFromLikedIDs(ctx context.Context, likedIDs []uint) ([]float32, error) {
 	if len(likedIDs) == 0 {
 		return nil, nil
 	}
@@ -289,6 +320,131 @@ func (f *FeedService) userInterestVector(ctx context.Context, accountID uint) ([
 		out[i] = float32(acc[i] / total)
 	}
 	return video.L2Normalize(out), nil
+}
+
+// roughSelectLongTailCandidates 分析用户近期高频点赞的 Top 标签，通过已有标签索引定向粗筛 50~100 条历史长尾候选并补齐向量。
+func (f *FeedService) roughSelectLongTailCandidates(ctx context.Context, likedIDs []uint) ([]video.VectorItem, map[uint]*video.Video) {
+	if len(likedIDs) == 0 || f.repo == nil {
+		return nil, nil
+	}
+
+	// 1. 获取点赞视频的标签列表
+	var tagMap map[uint][]string
+	var err error
+	if f.reasonSignals != nil {
+		tagMap, err = f.reasonSignals.VideoTagNames(ctx, likedIDs)
+	} else if lister, ok := f.repo.(ReasonSignalLookup); ok {
+		tagMap, err = lister.VideoTagNames(ctx, likedIDs)
+	}
+	if err != nil || len(tagMap) == 0 {
+		return nil, nil
+	}
+
+	// 2. 统计用户高频点赞标签
+	tagCounts := make(map[string]int)
+	for _, tags := range tagMap {
+		seen := make(map[string]bool, len(tags))
+		for _, tag := range tags {
+			if tag != "" && !seen[tag] {
+				seen[tag] = true
+				tagCounts[tag]++
+			}
+		}
+	}
+	if len(tagCounts) == 0 {
+		return nil, nil
+	}
+
+	type tagFreq struct {
+		name  string
+		count int
+	}
+	sortedTags := make([]tagFreq, 0, len(tagCounts))
+	for name, count := range tagCounts {
+		sortedTags = append(sortedTags, tagFreq{name: name, count: count})
+	}
+	sort.Slice(sortedTags, func(i, j int) bool {
+		if sortedTags[i].count != sortedTags[j].count {
+			return sortedTags[i].count > sortedTags[j].count
+		}
+		return sortedTags[i].name < sortedTags[j].name
+	})
+
+	topN := LongTailTopTags
+	if len(sortedTags) < topN {
+		topN = len(sortedTags)
+	}
+	topTags := sortedTags[:topN]
+
+	// 3. 通过已有标签倒排索引粗筛 50~100 条历史长尾候选
+	perTagLimit := LongTailMaxCandidates / len(topTags)
+	if perTagLimit < 30 {
+		perTagLimit = 30
+	}
+
+	// 排除当前常驻内存向量池中已有的视频 ID，下潜捞取真正的历史长尾内容（Task 9 / P2）。
+	var poolExcludeIDs []uint
+	if f.vectorPool != nil {
+		poolExcludeIDs = f.vectorPool.VideoIDs()
+	}
+
+	longTailVideos := make(map[uint]*video.Video)
+	longTailLister, hasLongTail := f.repo.(LongTailTagLister)
+	for _, tf := range topTags {
+		var candidates []*video.Video
+		if hasLongTail {
+			candidates, err = longTailLister.ListLongTailByTag(ctx, tf.name, perTagLimit, poolExcludeIDs)
+		} else {
+			candidates, err = f.repo.ListByTag(ctx, tf.name, perTagLimit)
+		}
+		if err != nil {
+			continue
+		}
+		for _, v := range candidates {
+			if v != nil && len(longTailVideos) < LongTailMaxCandidates {
+				longTailVideos[v.ID] = v
+			}
+		}
+		if len(longTailVideos) >= LongTailMaxCandidates {
+			break
+		}
+	}
+
+	if len(longTailVideos) == 0 {
+		return nil, nil
+	}
+
+	// 4. 补齐向量：优先从内存向量池命中，未命中则批量从持久化仓储 LoadVectors
+	var missingVectorIDs []uint
+	extraItems := make([]video.VectorItem, 0, len(longTailVideos))
+	for id := range longTailVideos {
+		if f.vectorPool != nil {
+			if item, ok := f.vectorPool.Get(id); ok && len(item.Vector) == f.embeddingDim {
+				extraItems = append(extraItems, item)
+				continue
+			}
+		}
+		missingVectorIDs = append(missingVectorIDs, id)
+	}
+
+	if len(missingVectorIDs) > 0 && f.vectorStore != nil {
+		loaded, err := f.vectorStore.LoadVectors(ctx, missingVectorIDs, f.effectiveModel(ctx), f.embeddingDim)
+		if err == nil {
+			for id, vec := range loaded {
+				if len(vec) == f.embeddingDim {
+					if v := longTailVideos[id]; v != nil {
+						extraItems = append(extraItems, video.VectorItem{
+							VideoID:    id,
+							CreateTime: v.CreateTime,
+							Vector:     vec,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return extraItems, longTailVideos
 }
 
 // cosine 计算两个向量的余弦相似度。

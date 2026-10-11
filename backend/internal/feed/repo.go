@@ -114,6 +114,23 @@ func (repo *FeedRepository) ListByTag(ctx context.Context, tagName string, limit
 	return videos, err
 }
 
+// ListLongTailByTag 按标签查询视频，并支持排除已有 ID（例如内存活跃向量池已包含的视频），
+// 避免长尾粗筛与热点池内容高度重叠，从而能够潜入更深的时间窗口检索出真正的历史长尾内容。
+func (repo *FeedRepository) ListLongTailByTag(ctx context.Context, tagName string, limit int, excludeIDs []uint) ([]*video.Video, error) {
+	var videos []*video.Video
+	query := repo.db.WithContext(ctx).Model(&video.Video{}).Table("videos").
+		Joins("JOIN video_tags ON video_tags.video_id = videos.id").
+		Joins("JOIN tags ON tags.id = video_tags.tag_id").
+		Where("tags.name = ?", tagName)
+	if len(excludeIDs) > 0 {
+		query = query.Where("videos.id NOT IN ?", excludeIDs)
+	}
+	err := query.Order("videos.create_time desc").
+		Limit(limit).
+		Find(&videos).Error
+	return videos, err
+}
+
 // ListFreshLowEngagement 返回"新且冷"的视频（P2 冷启动探索通道的数据来源）。
 //
 // 判据三条，每一条都对应一种"新内容永远没人看得到"的成因：
@@ -152,3 +169,33 @@ func (repo *FeedRepository) ListFreshLowEngagement(ctx context.Context, limit in
 	}
 	return videos, nil
 }
+
+// VideoTagNames 返回每个视频的标签名（基于 tags 与 video_tags 倒排索引）。
+func (repo *FeedRepository) VideoTagNames(ctx context.Context, videoIDs []uint) (map[uint][]string, error) {
+	out := make(map[uint][]string, len(videoIDs))
+	if len(videoIDs) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		VideoID uint
+		Name    string
+	}
+	err := repo.db.WithContext(ctx).
+		Table("video_tags AS vt").
+		Select("vt.video_id, t.name").
+		Joins("JOIN tags AS t ON t.id = vt.tag_id").
+		Where("vt.video_id IN ?", videoIDs).
+		Order("vt.video_id ASC, t.name ASC").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		if r.Name == "" {
+			continue
+		}
+		out[r.VideoID] = append(out[r.VideoID], r.Name)
+	}
+	return out, nil
+}
+

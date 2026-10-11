@@ -103,6 +103,19 @@ func (p *VectorPool) Snapshot() []VectorItem {
 	return *ptr
 }
 
+// VideoIDs 返回当前内存向量池中所有视频 ID 的切片（无锁读取快照）。
+func (p *VectorPool) VideoIDs() []uint {
+	snap := p.Snapshot()
+	if len(snap) == 0 {
+		return nil
+	}
+	ids := make([]uint, len(snap))
+	for i, item := range snap {
+		ids[i] = item.VideoID
+	}
+	return ids
+}
+
 // normalizeAndValidate 校验向量合法性并返回 L2 归一化后的独立切片副本。
 func (p *VectorPool) normalizeAndValidate(videoID uint, vec []float32) ([]float32, error) {
 	if videoID == 0 {
@@ -276,13 +289,41 @@ func (p *VectorPool) PutBatch(items []VectorItem) int {
 // SearchCosine 在内存向量池中对输入向量执行余弦相似度计算，排序并返回 Top-K 结果。
 // 支持通过 filter 回调前置排除曝光、冷启动或作者自身视频。计算完全常驻内存，耗时 <2ms。
 func (p *VectorPool) SearchCosine(query []float32, topK int, filter func(item VectorItem) bool) []ScoredVectorItem {
+	return p.SearchCosineWithExtra(query, nil, topK, filter)
+}
+
+// SearchCosineWithExtra 在内存向量池与额外的候选向量（例如长尾标签粗筛候选）中联合执行余弦相似度计算。
+// 兼顾热点内存池与长尾内容覆盖，自动对候选集进行 ID 去重，耗时低于 2ms。
+func (p *VectorPool) SearchCosineWithExtra(query []float32, extra []VectorItem, topK int, filter func(item VectorItem) bool) []ScoredVectorItem {
 	if topK <= 0 || len(query) != p.dim {
 		return nil
 	}
 
 	candidates := p.Snapshot()
-	if len(candidates) == 0 {
+	if len(candidates) == 0 && len(extra) == 0 {
 		return nil
+	}
+
+	if len(extra) > 0 {
+		if len(candidates) == 0 {
+			candidates = extra
+		} else {
+			seen := make(map[uint]bool, len(candidates)+len(extra))
+			combined := make([]VectorItem, 0, len(candidates)+len(extra))
+			for _, it := range candidates {
+				if !seen[it.VideoID] {
+					seen[it.VideoID] = true
+					combined = append(combined, it)
+				}
+			}
+			for _, it := range extra {
+				if !seen[it.VideoID] {
+					seen[it.VideoID] = true
+					combined = append(combined, it)
+				}
+			}
+			candidates = combined
+		}
 	}
 
 	// 确保 query 处于归一化状态（若未归一化就地归一化）
@@ -351,28 +392,33 @@ func (p *VectorPool) SearchCosine(query []float32, topK int, filter func(item Ve
 		}
 	}
 
-	slices.SortFunc(finalHeap, func(a, b ScoredVectorItem) int {
-		if a.Score != b.Score {
-			if a.Score > b.Score {
-				return -1
-			}
-			return 1
-		}
-		if !a.Item.CreateTime.Equal(b.Item.CreateTime) {
-			if a.Item.CreateTime.After(b.Item.CreateTime) {
-				return -1
-			}
-			return 1
-		}
-		if a.Item.VideoID > b.Item.VideoID {
-			return -1
-		} else if a.Item.VideoID < b.Item.VideoID {
-			return 1
-		}
-		return 0
-	})
+	slices.SortFunc(finalHeap, compareScoredVectorItem)
 
 	return finalHeap
+}
+
+// compareScoredVectorItem 比较两个打分向量项的优先级（降序排序比较器）。
+// 返回 -1 表示 a 优于 b，1 表示 a 劣于 b，0 表示相同。
+// 规则：分数高者优先；同分发布时间更晚者优先；同时间 VideoID 降序（严格可复现）。
+func compareScoredVectorItem(a, b ScoredVectorItem) int {
+	if a.Score != b.Score {
+		if a.Score > b.Score {
+			return -1
+		}
+		return 1
+	}
+	if !a.Item.CreateTime.Equal(b.Item.CreateTime) {
+		if a.Item.CreateTime.After(b.Item.CreateTime) {
+			return -1
+		}
+		return 1
+	}
+	if a.Item.VideoID > b.Item.VideoID {
+		return -1
+	} else if a.Item.VideoID < b.Item.VideoID {
+		return 1
+	}
+	return 0
 }
 
 func searchCosineChunk(normQuery []float32, candidates []VectorItem, topK int, filter func(item VectorItem) bool) []ScoredVectorItem {
@@ -383,7 +429,7 @@ func searchCosineChunk(normQuery []float32, candidates []VectorItem, topK int, f
 		}
 
 		dot := cosineDotProduct(normQuery, cand.Vector)
-		if dot <= 0 {
+		if math.IsNaN(dot) {
 			continue
 		}
 
@@ -401,26 +447,7 @@ func searchCosineChunk(normQuery []float32, candidates []VectorItem, topK int, f
 		}
 	}
 
-	slices.SortFunc(heap, func(a, b ScoredVectorItem) int {
-		if a.Score != b.Score {
-			if a.Score > b.Score {
-				return -1
-			}
-			return 1
-		}
-		if !a.Item.CreateTime.Equal(b.Item.CreateTime) {
-			if a.Item.CreateTime.After(b.Item.CreateTime) {
-				return -1
-			}
-			return 1
-		}
-		if a.Item.VideoID > b.Item.VideoID {
-			return -1
-		} else if a.Item.VideoID < b.Item.VideoID {
-			return 1
-		}
-		return 0
-	})
+	slices.SortFunc(heap, compareScoredVectorItem)
 
 	return heap
 }

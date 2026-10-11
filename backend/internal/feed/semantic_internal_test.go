@@ -3,6 +3,7 @@ package feed
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -402,6 +403,12 @@ type fakeFeedStore struct {
 	// probe 是探测用的桩：它模拟"数据库里最新的那批视频"。
 	// 不设时返回 freshest 对应的视频。
 	probe func() []*video.Video
+	// byTag 是标签倒排索引候选列表（长尾粗筛测试用）。
+	byTag map[string][]*video.Video
+	// tagNames 是视频对应的标签列表。
+	tagNames map[uint][]string
+	// getByIDs 允许测试拦截 GetByIDs 调用（测试超时和上下文预算）。
+	getByIDs func(ctx context.Context, ids []uint) ([]*video.Video, error)
 }
 
 func (f *fakeFeedStore) ListLatest(_ context.Context, limit int, _ time.Time) ([]*video.Video, error) {
@@ -427,7 +434,10 @@ func (f *fakeFeedStore) ListByPopularity(context.Context, int, int64, time.Time,
 	panic("本节不该调用 ListByPopularity")
 }
 
-func (f *fakeFeedStore) GetByIDs(_ context.Context, ids []uint) ([]*video.Video, error) {
+func (f *fakeFeedStore) GetByIDs(ctx context.Context, ids []uint) ([]*video.Video, error) {
+	if f.getByIDs != nil {
+		return f.getByIDs(ctx, ids)
+	}
 	out := make([]*video.Video, 0, len(ids))
 	for _, id := range ids {
 		if f.existing != nil && !f.existing[id] {
@@ -438,8 +448,49 @@ func (f *fakeFeedStore) GetByIDs(_ context.Context, ids []uint) ([]*video.Video,
 	return out, nil
 }
 
-func (f *fakeFeedStore) ListByTag(context.Context, string, int) ([]*video.Video, error) {
-	panic("本节不该调用 ListByTag")
+func (f *fakeFeedStore) ListByTag(_ context.Context, tagName string, limit int) ([]*video.Video, error) {
+	if f.byTag != nil {
+		all := f.byTag[tagName]
+		if limit > 0 && len(all) > limit {
+			all = all[:limit]
+		}
+		return all, nil
+	}
+	return nil, nil
+}
+
+func (f *fakeFeedStore) ListLongTailByTag(_ context.Context, tagName string, limit int, excludeIDs []uint) ([]*video.Video, error) {
+	if f.byTag != nil {
+		all := f.byTag[tagName]
+		exclude := make(map[uint]bool, len(excludeIDs))
+		for _, id := range excludeIDs {
+			exclude[id] = true
+		}
+		var filtered []*video.Video
+		for _, v := range all {
+			if v != nil && !exclude[v.ID] {
+				filtered = append(filtered, v)
+			}
+		}
+		if limit > 0 && len(filtered) > limit {
+			filtered = filtered[:limit]
+		}
+		return filtered, nil
+	}
+	return nil, nil
+}
+
+func (f *fakeFeedStore) VideoTagNames(_ context.Context, videoIDs []uint) (map[uint][]string, error) {
+	if f.tagNames != nil {
+		out := make(map[uint][]string, len(videoIDs))
+		for _, id := range videoIDs {
+			if tags, ok := f.tagNames[id]; ok {
+				out[id] = tags
+			}
+		}
+		return out, nil
+	}
+	return map[uint][]string{}, nil
 }
 
 func (f *fakeFeedStore) ListFreshLowEngagement(context.Context, int, time.Duration, int64, uint) ([]*video.Video, error) {
@@ -779,3 +830,333 @@ func TestTimelineProbeSkipsWaitWhenHeadCatchesUp(t *testing.T) {
 		t.Fatalf("等待了 %v：快速路径没有生效（首页会被无谓地拖慢）", waited)
 	}
 }
+
+// ---------- Ticket 05: 两级长尾标签粗筛与本地轻量特征重排测试 ----------
+
+// TestSemanticRecallLongTailTagRoughSelection 验证两级长尾标签粗筛逻辑：
+// 历史长尾优质视频（不在近期 2000 活跃内存池中）通过高频点赞标签倒排索引成功被粗筛并召回。
+func TestSemanticRecallLongTailTagRoughSelection(t *testing.T) {
+	// 场景设计：
+	// 1. 用户 7 最近点赞了视频 1，该视频打有标签 "golang"
+	// 2. 内存向量池中只有视频 2 (向量 [0.1, 0.9])
+	// 3. 视频 999 是半年前发布的历史长尾视频（不在内存池），打有标签 "golang"，向量为 [1, 0] (与用户兴趣完全契合)
+	store := &fakeVectorStore{
+		accountID: 7,
+		liked:     []uint{1},
+		vectors: map[uint][]float32{
+			1:   {1, 0},
+			2:   {0.1, 0.9},
+			999: {1, 0}, // 仓储中存有视频 999 的 1536 维向量
+		},
+	}
+
+	svc, repo := newSemanticService(t, store, 0.5)
+
+	// 配置标签关系
+	repo.tagNames = map[uint][]string{
+		1: {"golang", "backend"},
+	}
+	repo.byTag = map[string][]*video.Video{
+		"golang": {semanticVideoAt(999, time.Now().Add(-180*24*time.Hour))},
+	}
+	repo.existing = map[uint]bool{
+		1:   true,
+		2:   true,
+		999: true,
+	}
+
+	// 内存池初始化只有视频 2
+	pool := video.NewVectorPool(10, 2)
+	pool.Put(video.VectorItem{
+		VideoID:    2,
+		CreateTime: time.Now().Add(-1 * time.Hour),
+		Vector:     []float32{0.1, 0.9},
+	})
+	svc.WithVectorPool(pool)
+
+	// 执行语义召回
+	hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 2})
+	if len(hits) == 0 {
+		t.Fatal("两级召回未返回任何结果")
+	}
+
+	// 历史长尾视频 999 应当成功被粗筛出、补齐向量打分，并以高分排在首位
+	found999 := false
+	for _, h := range hits {
+		if h.Video.ID == 999 {
+			found999 = true
+			if math.Abs(h.Score-1.0) > 1e-3 {
+				t.Fatalf("长尾视频 999 相似度得分 = %f, want 1.0", h.Score)
+			}
+			break
+		}
+	}
+	if !found999 {
+		t.Fatalf("长尾带标签视频 999 未被成功召回: got %v", hits)
+	}
+
+	if hits[0].Video.ID != 999 {
+		t.Fatalf("高分长尾视频 999 应当排在第一位, 实际第一位为 %d", hits[0].Video.ID)
+	}
+}
+
+// TestSemanticRecallLongTailDeduplicationAndComplementVectors 验证长尾候选与内存池去重以及向量缺失补齐。
+func TestSemanticRecallLongTailDeduplicationAndComplementVectors(t *testing.T) {
+	store := &fakeVectorStore{
+		accountID: 7,
+		liked:     []uint{10},
+		vectors: map[uint][]float32{
+			10:  {1, 0},
+			20:  {0.8, 0.6},
+			100: {0.9, 0.4},
+		},
+	}
+
+	svc, repo := newSemanticService(t, store, 0.5)
+
+	repo.tagNames = map[uint][]string{
+		10: {"k8s"},
+	}
+	// 标签粗筛捞到视频 20 (已在内存池) 和 视频 100 (不在内存池)
+	v20 := semanticVideoAt(20, time.Now().Add(-2*time.Hour))
+	v100 := semanticVideoAt(100, time.Now().Add(-100*time.Hour))
+	repo.byTag = map[string][]*video.Video{
+		"k8s": {v20, v100},
+	}
+	repo.existing = map[uint]bool{
+		10:  true,
+		20:  true,
+		100: true,
+	}
+
+	pool := video.NewVectorPool(10, 2)
+	pool.Put(video.VectorItem{
+		VideoID:    20,
+		CreateTime: v20.CreateTime,
+		Vector:     []float32{0.8, 0.6},
+	})
+	svc.WithVectorPool(pool)
+
+	hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 5})
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 unique hits, got %d: %v", len(hits), hits)
+	}
+
+	// 验证 ID 无重复
+	seen := make(map[uint]bool)
+	for _, h := range hits {
+		if seen[h.Video.ID] {
+			t.Fatalf("duplicate video ID in hits: %d", h.Video.ID)
+		}
+		seen[h.Video.ID] = true
+	}
+}
+
+// TestSemanticRecallLongTailDeepDivesExcludingMemoryPool 验证 Task 9:
+// 优化长尾标签粗筛查询深度：通过 excludeIDs 排除内存活跃池已有视频，
+// 使得标签倒排索引能够潜入更深的历史窗口，捞取真正未常驻内存的长尾候选。
+func TestSemanticRecallLongTailDeepDivesExcludingMemoryPool(t *testing.T) {
+	store := &fakeVectorStore{
+		accountID: 7,
+		liked:     []uint{1},
+		vectors: map[uint][]float32{
+			1:   {1, 0},
+			10:  {0.7, 0.7}, // 内存池中视频
+			500: {0.9, 0.4}, // 历史深水区长尾视频
+		},
+	}
+	svc, repo := newSemanticService(t, store, 0.5)
+
+	repo.tagNames = map[uint][]string{
+		1: {"rust"},
+	}
+
+	vPool := semanticVideoAt(10, time.Now().Add(-1*time.Hour))
+	vHistory := semanticVideoAt(500, time.Now().Add(-200*24*time.Hour))
+
+	repo.byTag = map[string][]*video.Video{
+		"rust": {vPool, vHistory},
+	}
+	repo.existing = map[uint]bool{
+		1:   true,
+		10:  true,
+		500: true,
+	}
+
+	pool := video.NewVectorPool(10, 2)
+	pool.Put(video.VectorItem{
+		VideoID:    10,
+		CreateTime: vPool.CreateTime,
+		Vector:     []float32{0.7, 0.7},
+	})
+	svc.WithVectorPool(pool)
+
+	hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 5})
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits, got %d: %v", len(hits), hits)
+	}
+
+	foundHistory := false
+	for _, h := range hits {
+		if h.Video.ID == 500 {
+			foundHistory = true
+			break
+		}
+	}
+	if !foundHistory {
+		t.Errorf("expected history video 500 to be recalled via deep dive excluding pool ID 10")
+	}
+}
+
+// TestListLatestEndToEndDecoupledFromLLMRPC 验证读链路完全脱离外部大模型 RPC，即使外部模型超时或宕机也不受任何影响。
+func TestListLatestEndToEndDecoupledFromLLMRPC(t *testing.T) {
+	store := &fakeVectorStore{
+		accountID: 7,
+		liked:     []uint{1},
+		vectors: map[uint][]float32{
+			1: {1, 0},
+			2: {0.9, 0.4},
+		},
+	}
+
+	svc, repo := newSemanticService(t, store, 0.5)
+
+	// 模拟外部 LLM Rerank 客户端（设置超长延迟并断言其调用次数必须为 0）
+	mockLLM := &scriptedReranker{
+		err:   errors.New("sidecar gRPC down"),
+		delay: 5 * time.Second, // 若读链路上仍有调用，测试会明显阻塞甚至超时
+	}
+	svc.WithRerank(RerankOptions{
+		Client:  mockLLM,
+		Enabled: true,
+		Timeout: 20 * time.Millisecond,
+		TopN:    5,
+	})
+
+	now := time.Now()
+	v1 := semanticVideoAt(1, now.Add(-10*time.Minute))
+	v2 := semanticVideoAt(2, now.Add(-2*time.Hour))
+	v3 := semanticVideoAt(3, now.Add(-5*time.Minute))
+
+	repo.existing = map[uint]bool{1: true, 2: true, 3: true}
+	repo.probe = func() []*video.Video {
+		return []*video.Video{v3, v1}
+	}
+
+	pool := video.NewVectorPool(10, 2)
+	pool.Put(video.VectorItem{
+		VideoID:    2,
+		CreateTime: v2.CreateTime,
+		Vector:     []float32{0.9, 0.4},
+	})
+	svc.WithVectorPool(pool)
+
+	start := time.Now()
+	resp, err := svc.ListLatest(context.Background(), 2, time.Time{}, 7)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ListLatest returned unexpected error: %v", err)
+	}
+	if len(resp.VideoList) == 0 {
+		t.Fatal("ListLatest returned empty items")
+	}
+
+	// 断言：全流程耗时极短（<100ms），绝无 5 秒的外部大模型 RPC 阻塞
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("读链路耗时 %v 超出预期，疑似被外部大模型阻塞", elapsed)
+	}
+
+	// 断言：外部大模型 Rerank 客户端被完全解耦，读链路调用次数为 0
+	if mockLLM.calls != 0 {
+		t.Fatalf("读链路上不应调用外部大模型，实际调用次数 = %d", mockLLM.calls)
+	}
+}
+
+// TestSemanticRecallMaterialFetchRespectsTimeout 验证 Task 1:
+// 语义召回在 GetByIDs 与 candidateFilter 时必须严格使用 opCtx 预算，
+// 底层慢查询或挂起时平滑降级为 nil，绝不能击穿超时预算（耗时严格受限）。
+func TestSemanticRecallMaterialFetchRespectsTimeout(t *testing.T) {
+	t.Run("GetByIDsTimeout", func(t *testing.T) {
+		store := &fakeVectorStore{
+			accountID: 7,
+			liked:     []uint{1},
+			vectors: map[uint][]float32{
+				1: {1, 0},
+				2: {1, 0},
+			},
+		}
+		svc, repo := newSemanticService(t, store, 0.5)
+		svc.semanticTimeout = 40 * time.Millisecond
+
+		pool := video.NewVectorPool(10, 2)
+		pool.Put(video.VectorItem{
+			VideoID:    2,
+			CreateTime: time.Now(),
+			Vector:     []float32{1, 0},
+		})
+		svc.WithVectorPool(pool)
+
+		var getByIDsCtxHasDeadline bool
+		repo.getByIDs = func(ctx context.Context, ids []uint) ([]*video.Video, error) {
+			_, getByIDsCtxHasDeadline = ctx.Deadline()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+				return []*video.Video{semanticVideo(2)}, nil
+			}
+		}
+
+		start := time.Now()
+		hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 2})
+		elapsed := time.Since(start)
+
+		if hits != nil {
+			t.Fatalf("expected nil hits on timeout degrade, got: %v", hits)
+		}
+		if !getByIDsCtxHasDeadline {
+			t.Errorf("repo.GetByIDs should receive opCtx with deadline, but got unbudgeted ctx")
+		}
+		if elapsed > 150*time.Millisecond {
+			t.Errorf("semanticRecall took %v, want <= 150ms with 40ms timeout", elapsed)
+		}
+	})
+
+	t.Run("CandidateFilterContext", func(t *testing.T) {
+		store := &fakeVectorStore{
+			accountID: 7,
+			liked:     []uint{1},
+			vectors: map[uint][]float32{
+				1: {1, 0},
+				2: {1, 0},
+			},
+		}
+		svc, repo := newSemanticService(t, store, 0.5)
+		svc.semanticTimeout = 100 * time.Millisecond
+
+		pool := video.NewVectorPool(10, 2)
+		pool.Put(video.VectorItem{
+			VideoID:    2,
+			CreateTime: time.Now(),
+			Vector:     []float32{1, 0},
+		})
+		svc.WithVectorPool(pool)
+		repo.existing = map[uint]bool{2: true}
+
+		var filterCtxHasDeadline bool
+		svc.candidateFilter = func(ctx context.Context, viewerID uint, v *video.Video) bool {
+			_, filterCtxHasDeadline = ctx.Deadline()
+			return true
+		}
+
+		hits := svc.semanticRecall(context.Background(), 7, QuotaPlan{Semantic: 2})
+		if len(hits) != 1 {
+			t.Fatalf("expected 1 hit, got %d", len(hits))
+		}
+		if !filterCtxHasDeadline {
+			t.Errorf("candidateFilter should receive opCtx with deadline, but got unbudgeted ctx")
+		}
+	})
+}
+
