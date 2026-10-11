@@ -22,6 +22,8 @@ type VideoService struct {
 	// analysisMQ 是 P1 新增的 AI 分析任务投递器，为 nil 表示不投递
 	// （AI 关闭、或 MQ 不可用）。用接口类型而不是具体类型：见 video_store.go。
 	analysisMQ ContentAnalysisPublisher
+	// embeddingTrigger 是 P2 视频发布后即时触发单条向量计算的能力，为 nil 表示不触发。
+	embeddingTrigger EmbeddingTrigger
 }
 
 func NewVideoService(repo VideoStore, cache *rediscache.Client, popularityMQ PopularityPublisher) *VideoService {
@@ -35,6 +37,12 @@ func NewVideoService(repo VideoStore, cache *rediscache.Client, popularityMQ Pop
 // 而默认状态恰恰应当是最省事的那条路径。装配层只在 AI 真的打开时才调用它。
 func (vs *VideoService) WithContentAnalysis(p ContentAnalysisPublisher) *VideoService {
 	vs.analysisMQ = p
+	return vs
+}
+
+// WithEmbeddingTrigger 注入即时向量化触发器，返回自身以支持链式装配。
+func (vs *VideoService) WithEmbeddingTrigger(t EmbeddingTrigger) *VideoService {
+	vs.embeddingTrigger = t
 	return vs
 }
 
@@ -76,6 +84,7 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
 	// 打标丢了可以事后批量补跑，视频本身完全正常；
 	// 而 timeline 事件丢了，视频就永远不出现在任何人的时间线里。
 	vs.requestAnalysis(ctx, video)
+	vs.triggerEmbedding(ctx, video)
 	return nil
 }
 
@@ -101,6 +110,17 @@ func (vs *VideoService) requestAnalysis(ctx context.Context, video *Video) {
 	// 投递失败：放弃本次分析（不降级直写、不重试到阻塞请求）。故为 Warn。
 	logging.Ctx(ctx).Warn("AI 分析任务投递失败，本次打标跳过（不影响视频发布）",
 		zap.Uint("video_id", video.ID), zap.Error(err))
+}
+
+// triggerEmbedding 触发单条视频的即时向量化。任何失败都只记 Warn，不影响发布结果（best-effort 隔离）。
+func (vs *VideoService) triggerEmbedding(ctx context.Context, video *Video) {
+	if vs.embeddingTrigger == nil || video == nil || video.ID == 0 {
+		return
+	}
+	if err := vs.embeddingTrigger.TriggerEmbedding(ctx, video.ID); err != nil {
+		logging.Ctx(ctx).Warn("即时向量化任务触发失败，等待后台游标巡检兜底（不影响视频发布）",
+			zap.Uint("video_id", video.ID), zap.Error(err))
+	}
 }
 
 func (vs *VideoService) Delete(ctx context.Context, id uint, authorID uint) error {

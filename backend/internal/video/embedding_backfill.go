@@ -49,8 +49,9 @@ func IsNoEmbedding(err error) bool {
 
 // EmbeddingBackfillStore 是回填所需的持久化能力（接口定义在消费方，本包）。
 type EmbeddingBackfillStore interface {
-	ListEmbeddingTargets(ctx context.Context, model string, dim int, limit int) ([]EmbeddingTarget, error)
+	ListEmbeddingTargets(ctx context.Context, afterID uint, model string, dim int, limit int) ([]EmbeddingTarget, error)
 	UpsertEmbeddings(ctx context.Context, rows []VideoEmbedding) error
+	GetEmbeddingTarget(ctx context.Context, videoID uint, model string, dim int) (*EmbeddingTarget, error)
 }
 
 // 编译期断言：GORM 实现必须始终满足这个接口。
@@ -124,6 +125,8 @@ type BackfillStats struct {
 	Failed int
 	// Pending 是检查完之后仍然需要向量化的条数（>0 表示还没扫完）。
 	Pending int
+	// Cursor 是本次回填扫描结束时的游标位置（最后一条视频 ID 或复位值）。
+	Cursor uint
 }
 
 // Progress 报告本次回填是否有任何变化，供后台循环决定要不要打日志。
@@ -142,6 +145,10 @@ type EmbeddingBackfiller struct {
 	opts   BackfillOptions
 	// reqSeq 只用来生成可读的 request_id（把 Go 日志与 sidecar 日志对上）。
 	reqSeq atomic.Uint64
+	// cursor 记录当前全表巡检推进到的视频主键 ID（0 表示从头开始）。
+	cursor atomic.Uint64
+	// pool 是可选注入的堆内向量缓存池，写入成功后同步增量推入。
+	pool *VectorPool
 }
 
 // NewEmbeddingBackfiller 构造回填器。client 为 nil 时退化为 Noop 客户端，
@@ -152,6 +159,17 @@ func NewEmbeddingBackfiller(store EmbeddingBackfillStore, client ai.EmbeddingCli
 		client = ai.NewNoopEmbedding()
 	}
 	return &EmbeddingBackfiller{store: store, client: client, opts: opts}
+}
+
+// WithVectorPool 注入内存向量缓存池，返回自身以支持链式装配。
+func (b *EmbeddingBackfiller) WithVectorPool(p *VectorPool) *EmbeddingBackfiller {
+	b.pool = p
+	return b
+}
+
+// Cursor 返回当前游标位置。
+func (b *EmbeddingBackfiller) Cursor() uint {
+	return uint(b.cursor.Load())
 }
 
 // withDefaults 把零值参数补成安全值。
@@ -212,11 +230,26 @@ func (b *EmbeddingBackfiller) BackfillOnce(ctx context.Context) (BackfillStats, 
 	ctx, cancel := context.WithTimeout(ctx, b.opts.Timeout)
 	defer cancel()
 
-	targets, err := b.store.ListEmbeddingTargets(ctx, b.opts.Model, b.opts.Dim, b.opts.BatchLimit)
+	currentCursor := uint(b.cursor.Load())
+	targets, err := b.store.ListEmbeddingTargets(ctx, currentCursor, b.opts.Model, b.opts.Dim, b.opts.BatchLimit)
 	if err != nil {
 		return stats, fmt.Errorf("video: 列出待向量化视频失败: %w", err)
 	}
 	stats.Scanned = len(targets)
+	if len(targets) == 0 {
+		b.cursor.Store(0)
+		stats.Cursor = 0
+		return stats, nil
+	}
+
+	lastID := targets[len(targets)-1].VideoID
+	if len(targets) < b.opts.BatchLimit {
+		// 已扫到表尾，游标自动复位回 0，便于下一轮从头巡检
+		b.cursor.Store(0)
+	} else {
+		b.cursor.Store(uint64(lastID))
+	}
+	stats.Cursor = lastID
 
 	// 只保留真正需要重算的：从来没有向量，或内容指纹变了。
 	//
@@ -237,95 +270,10 @@ func (b *EmbeddingBackfiller) BackfillOnce(ctx context.Context) (BackfillStats, 
 			end = len(stale)
 		}
 		batch := stale[start:end]
-
-		texts := make([]string, 0, len(batch))
-		kept := make([]EmbeddingTarget, 0, len(batch))
-		for _, t := range batch {
-			text := strings.TrimSpace(EmbeddingText(t.Title, t.Description))
-			if text == "" {
-				// 没有文本就没有向量。这不是失败：一条只有标题为空、
-				// 描述也为空的视频（历史数据、或被清空过）本来就没有语义可言。
-				stats.Skipped++
-				continue
-			}
-			texts = append(texts, text)
-			kept = append(kept, t)
-		}
-		if len(texts) == 0 {
-			continue
-		}
-
-		res, err := b.client.Embed(ctx, ai.EmbeddingRequest{
-			Inputs:    texts,
-			Model:     b.opts.Model,
-			Normalize: b.opts.NormalizeOr(),
-			RequestID: b.nextRequestID(),
-		})
-		if err != nil {
-			// 整批失败：不重试（重试由周期循环的下一次调用兜底）。
-			// 这里刻意不把上下文取消当成"失败"之外的信号：调用方
-			// （后台循环）在进程退出时同样会看到它，日志里区分得出来。
-			stats.Failed += len(texts)
-			b.logWarn(ctx, "向量化失败，本批跳过（下一轮会重试）", zap.Int("batch", len(texts)), zap.Error(err))
-			continue
-		}
-		if err := ai.ValidateEmbeddingResult(res, len(texts), b.opts.Dim); err != nil {
-			// 契约不满足（条数错位、维度不符）：**整批丢弃**。
-			// 按能对上的部分入库会造成文本与向量永久错配，
-			// 而那种错配在检索结果里只表现为"不够准"，几乎无法反查。
-			stats.Failed += len(texts)
-			b.logWarn(ctx, "向量结果不符合契约，整批丢弃", zap.Int("batch", len(texts)), zap.Error(err))
-			continue
-		}
-
-		// 入库用的模型名取自响应：只有提供方知道这批向量是谁算的。
-		// 为空时退回请求里的名字（老版本 sidecar 不回填 model 的情况）。
-		storedModel := strings.TrimSpace(res.Model)
-		if storedModel == "" {
-			storedModel = b.opts.Model
-		}
-		if storedModel != b.opts.Model {
-			// 这不是错误，但必须让人看得见：库里的空间名与配置名不同，
-			// 而读路径按"实际空间"取（见 ListEmbeddingModels），
-			// 因此功能正常——但读者会疑惑"为什么库里是 faux-lexical"。
-			logging.Ctx(ctx).Info("向量入库使用提供方回报的模型名（与配置不同）",
-				zap.String("configured_model", b.opts.Model),
-				zap.String("provider_model", storedModel))
-		}
-
-		rows := make([]VideoEmbedding, 0, len(kept))
-		for i, t := range kept {
-			vec := res.Vectors[i]
-			if b.opts.SkipZero && isZeroVector(vec) {
-				// 零向量不入库：它与任何向量的余弦都是 0，会让这条视频
-				// 永久占据召回池里的一个位置却永远排不上来。
-				stats.Skipped++
-				continue
-			}
-			blob, err := EncodeVector(vec)
-			if err != nil {
-				stats.Failed++
-				b.logWarn(ctx, "向量编码失败，跳过该条", zap.Uint("video_id", t.VideoID), zap.Error(err))
-				continue
-			}
-			rows = append(rows, VideoEmbedding{
-				VideoID:     t.VideoID,
-				Model:       storedModel,
-				Dim:         len(vec),
-				ContentHash: t.CurrentHash,
-				Normalized:  b.opts.NormalizeOr() && res.Normalized,
-				Vector:      blob,
-			})
-		}
-		if len(rows) == 0 {
-			continue
-		}
-		if err := b.store.UpsertEmbeddings(ctx, rows); err != nil {
-			stats.Failed += len(rows)
-			b.logWarn(ctx, "向量入库失败", zap.Int("rows", len(rows)), zap.Error(err))
-			continue
-		}
-		stats.Embedded += len(rows)
+		e, s, f, _ := b.embedBatch(ctx, batch)
+		stats.Embedded += e
+		stats.Skipped += s
+		stats.Failed += f
 	}
 
 	// 仍然需要向量化的条数：本次扫描范围内没做完的部分。
@@ -334,6 +282,147 @@ func (b *EmbeddingBackfiller) BackfillOnce(ctx context.Context) (BackfillStats, 
 		stats.Pending = 0
 	}
 	return stats, nil
+}
+
+// embedBatch 批量执行文本 Embedding、契约校验、落库并同步增量更新内存向量池。
+func (b *EmbeddingBackfiller) embedBatch(ctx context.Context, batch []EmbeddingTarget) (embedded int, skipped int, failed int, err error) {
+	texts := make([]string, 0, len(batch))
+	kept := make([]EmbeddingTarget, 0, len(batch))
+	for _, t := range batch {
+		text := strings.TrimSpace(EmbeddingText(t.Title, t.Description))
+		if text == "" {
+			// 没有文本就没有向量。这不是失败：一条标题与描述均为空的内容本来就没有语义可言。
+			skipped++
+			continue
+		}
+		texts = append(texts, text)
+		kept = append(kept, t)
+	}
+	if len(texts) == 0 {
+		return 0, skipped, 0, nil
+	}
+
+	res, embedErr := b.client.Embed(ctx, ai.EmbeddingRequest{
+		Inputs:    texts,
+		Model:     b.opts.Model,
+		Normalize: b.opts.NormalizeOr(),
+		RequestID: b.nextRequestID(),
+	})
+	if embedErr != nil {
+		b.logWarn(ctx, "向量化失败，本批跳过（下一轮会重试）", zap.Int("batch", len(texts)), zap.Error(embedErr))
+		return 0, skipped, len(texts), embedErr
+	}
+	if valErr := ai.ValidateEmbeddingResult(res, len(texts), b.opts.Dim); valErr != nil {
+		b.logWarn(ctx, "向量结果不符合契约，整批丢弃", zap.Int("batch", len(texts)), zap.Error(valErr))
+		return 0, skipped, len(texts), valErr
+	}
+
+	storedModel := strings.TrimSpace(res.Model)
+	if storedModel == "" {
+		storedModel = b.opts.Model
+	}
+	if storedModel != b.opts.Model {
+		logging.Ctx(ctx).Info("向量入库使用提供方回报的模型名（与配置不同）",
+			zap.String("configured_model", b.opts.Model),
+			zap.String("provider_model", storedModel))
+	}
+
+	rows := make([]VideoEmbedding, 0, len(kept))
+	poolItems := make([]VectorItem, 0, len(kept))
+	for i, t := range kept {
+		vec := res.Vectors[i]
+		if b.opts.SkipZero && isZeroVector(vec) {
+			skipped++
+			continue
+		}
+		blob, encErr := EncodeVector(vec)
+		if encErr != nil {
+			failed++
+			b.logWarn(ctx, "向量编码失败，跳过该条", zap.Uint("video_id", t.VideoID), zap.Error(encErr))
+			continue
+		}
+		rows = append(rows, VideoEmbedding{
+			VideoID:     t.VideoID,
+			Model:       storedModel,
+			Dim:         len(vec),
+			ContentHash: t.CurrentHash,
+			Normalized:  b.opts.NormalizeOr() && res.Normalized,
+			Vector:      blob,
+		})
+		poolItems = append(poolItems, VectorItem{
+			VideoID:    t.VideoID,
+			CreateTime: t.CreateTime,
+			Vector:     vec,
+		})
+	}
+	if len(rows) == 0 {
+		return 0, skipped, failed, nil
+	}
+	if upsertErr := b.store.UpsertEmbeddings(ctx, rows); upsertErr != nil {
+		b.logWarn(ctx, "向量入库失败", zap.Int("rows", len(rows)), zap.Error(upsertErr))
+		return 0, skipped, failed + len(rows), upsertErr
+	}
+	if b.pool != nil && len(poolItems) > 0 {
+		b.pool.PutBatch(poolItems)
+	}
+	return len(rows), skipped, failed, nil
+}
+
+// EmbedVideo 为指定视频即时生成向量、落库并同步更新内存向量池。
+// 若视频不存在则返回错误；若内容未变（指纹一致）则跳过计算并返回 nil。
+func (b *EmbeddingBackfiller) EmbedVideo(ctx context.Context, videoID uint) error {
+	if b == nil || b.store == nil {
+		return errors.New("video: 回填器未初始化（store 为空）")
+	}
+	if videoID == 0 {
+		return errors.New("video: video_id 不能为空")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, b.opts.Timeout)
+	defer cancel()
+
+	target, err := b.store.GetEmbeddingTarget(ctx, videoID, b.opts.Model, b.opts.Dim)
+	if err != nil {
+		return fmt.Errorf("video: 获取待向量化视频失败: %w", err)
+	}
+	if target == nil {
+		return fmt.Errorf("video: 视频不存在 vid=%d", videoID)
+	}
+
+	if !target.NeedsEmbedding() {
+		// 内容未变且已有向量，无需重复计算
+		return nil
+	}
+
+	embedded, skipped, failed, err := b.embedBatch(ctx, []EmbeddingTarget{*target})
+	if err != nil {
+		return err
+	}
+	if failed > 0 {
+		return fmt.Errorf("video: vid=%d 向量化失败", videoID)
+	}
+	if skipped > 0 && embedded == 0 {
+		return &noEmbeddingError{reason: "无可向量化文本或为零向量"}
+	}
+	return nil
+}
+
+// TriggerEmbedding 满足 EmbeddingTrigger 接口，异步触发单条视频的向量化计算。
+// 任何非跳过错误记 Warn，不阻塞调用方。
+func (b *EmbeddingBackfiller) TriggerEmbedding(ctx context.Context, videoID uint) error {
+	if b == nil || videoID == 0 {
+		return nil
+	}
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), b.opts.Timeout)
+		defer cancel()
+		if err := b.EmbedVideo(bgCtx, videoID); err != nil {
+			if !IsNoEmbedding(err) {
+				b.logWarn(bgCtx, "即时向量化失败，等待巡检补偿", zap.Uint("video_id", videoID), zap.Error(err))
+			}
+		}
+	}()
+	return nil
 }
 
 func (b *EmbeddingBackfiller) nextRequestID() string {

@@ -10,6 +10,7 @@ import (
 //go:generate mockgen -destination=mock/video_existence_store_mock.go -package=mock github.com/handlerzzy/feedsystem/internal/video VideoExistenceStore
 //go:generate mockgen -destination=mock/popularity_publisher_mock.go -package=mock github.com/handlerzzy/feedsystem/internal/video PopularityPublisher
 //go:generate mockgen -destination=mock/content_analysis_publisher_mock.go -package=mock github.com/handlerzzy/feedsystem/internal/video ContentAnalysisPublisher
+//go:generate mockgen -destination=mock/embedding_trigger_mock.go -package=mock github.com/handlerzzy/feedsystem/internal/video EmbeddingTrigger
 
 // VideoStore 是 VideoService 通过 repo 调用的视频持久化能力。
 //
@@ -69,11 +70,20 @@ type ContentAnalysisPublisher interface {
 	Request(ctx context.Context, evt rabbitmq.ContentAnalysisEvent) error
 }
 
-// 编译期断言：GORM / RabbitMQ 实现必须始终满足这些接口。
+// EmbeddingTrigger 是 VideoService 发布视频后即时触发向量计算的能力。
+//
+// 为什么定义接口：解耦视频发布业务流与具体的单条向量计算/消息投递实现；
+// 保证"即时向量化失败只记 Warn、绝不影响发布结果"的 best-effort 隔离契约。
+type EmbeddingTrigger interface {
+	TriggerEmbedding(ctx context.Context, videoID uint) error
+}
+
+// 编译期断言：GORM / RabbitMQ / Backfiller 实现必须始终满足这些接口。
 // 若方法签名漂移，这里会立刻编译失败，而不是等到某个测试莫名其妙地报错。
 var (
 	_ VideoStore               = (*VideoRepository)(nil)
 	_ VideoExistenceStore      = (*VideoRepository)(nil)
 	_ PopularityPublisher      = (*rabbitmq.PopularityMQ)(nil)
 	_ ContentAnalysisPublisher = (*rabbitmq.ContentAnalysisMQ)(nil)
+	_ EmbeddingTrigger         = (*EmbeddingBackfiller)(nil)
 )

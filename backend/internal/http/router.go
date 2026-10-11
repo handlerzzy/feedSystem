@@ -111,6 +111,23 @@ func SetRouter(deps Deps) *gin.Engine {
 		protectedAccountGroup.POST("/uploadAvatar", accountHandler.UploadAvatar)
 		protectedAccountGroup.POST("/updateProfile", accountHandler.UpdateProfile)
 	}
+	// AI 客户端装配（P0/P1/P2）。两个客户端都只做本地装配：gRPC 连接是惰性的，
+	// sidecar 不在也不影响 API 启动。
+	aiClient, aiReason := aiapp.NewClient(cfg.AI)
+	if aiReason != nil {
+		logging.L().Warn("AI 未启用（配置不完整，已降级为 noop）",
+			zap.Bool("ai_enabled", cfg.AI.Enabled), zap.Error(aiReason))
+	}
+	embeddingClient, embedReason := aiapp.NewEmbeddingClient(cfg.AI)
+	if embedReason != nil {
+		logging.L().Warn("向量通道未启用（配置不完整，已降级为 noop）",
+			zap.Bool("ai_enabled", cfg.AI.Enabled), zap.Error(embedReason))
+	}
+	defer func() {
+		_ = aiClient.Close()
+		_ = embeddingClient.Close()
+	}()
+
 	// video
 	videoRepository := video.NewVideoRepository(db)
 	// 以下四处都用**接口类型**的变量声明再赋值。
@@ -141,6 +158,21 @@ func SetRouter(deps Deps) *gin.Engine {
 		logging.L().Warn("ContentAnalysisMQ init failed (AI tagging disabled)", zap.Error(err))
 	} else {
 		videoService.WithContentAnalysis(mq)
+	}
+	// P2 视频发布即时向量化触发器：发布成功后异步触发单条视频的向量生成与落库，并增量同步至堆内向量池。
+	if cfg.AI.Enabled && embedReason == nil {
+		backfillOpts := video.DefaultBackfillOptions()
+		backfillOpts.Model = cfg.AI.EmbeddingModelOr()
+		backfillOpts.Dim = cfg.AI.EmbeddingDimOr()
+		normalize := true
+		backfillOpts.Normalize = &normalize
+		vectorPool := video.NewVectorPool(video.DefaultVectorPoolCapacity, backfillOpts.Dim)
+		if warmed, err := videoRepository.LoadRecentVectors(context.Background(), backfillOpts.Model, backfillOpts.Dim, video.DefaultVectorPoolCapacity); err == nil && len(warmed) > 0 {
+			vectorPool.PutBatch(warmed)
+		}
+		backfiller := video.NewEmbeddingBackfiller(videoRepository, embeddingClient, backfillOpts).
+			WithVectorPool(vectorPool)
+		videoService.WithEmbeddingTrigger(backfiller)
 	}
 	videoHandler := video.NewVideoHandler(videoService, accountService)
 	chunkHandler := video.NewChunkUploadHandler(cache)
@@ -225,27 +257,6 @@ func SetRouter(deps Deps) *gin.Engine {
 	// 注入 AI 摘要查询能力（P1）。它是**可选**依赖：
 	// 表为空、AI 关闭、甚至将来这张表被整体删除，Feed 都照常返回，
 	// 只是不携带 summary 字段（见 feed.FeedVideoItem.Summary 的 omitempty）。
-	// AI 通道（P0/P1/P2）。**两个客户端都只做本地装配**：gRPC 连接是惰性的，
-	// sidecar 不在也不影响 API 启动（见 internal/ai/client 的注释）。
-	//
-	// 为什么把这段放在 feed 之前：P2 的语义路与精排都要用它们，
-	// 而装配失败的降级策略必须与 P1 的打标完全一致（Warn + 继续）。
-	aiClient, aiReason := aiapp.NewClient(cfg.AI)
-	if aiReason != nil {
-		// 配置不完整导致的降级（开关开着但地址缺失/非法）。运维需要知道，故为 Warn。
-		logging.L().Warn("AI 未启用（配置不完整，已降级为 noop）",
-			zap.Bool("ai_enabled", cfg.AI.Enabled), zap.Error(aiReason))
-	}
-	embeddingClient, embedReason := aiapp.NewEmbeddingClient(cfg.AI)
-	if embedReason != nil {
-		logging.L().Warn("向量通道未启用（配置不完整，已降级为 noop）",
-			zap.Bool("ai_enabled", cfg.AI.Enabled), zap.Error(embedReason))
-	}
-	defer func() {
-		// 关闭连接。允许重复调用：Noop 的 Close 也是空实现。
-		_ = aiClient.Close()
-		_ = embeddingClient.Close()
-	}()
 
 	feedService := feed.NewFeedService(feedRepository, likeRepository, cache).
 		WithSummaryLookup(videoRepository).

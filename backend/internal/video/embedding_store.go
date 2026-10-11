@@ -31,11 +31,15 @@ type EmbeddingStore interface {
 
 	// ListEmbeddingTargets 列出待（重新）向量化的视频。
 	//
+	// 接收递增主键游标 afterID，底层 SQL 使用 WHERE v.id > ? 进行高效索引范围扫描，
 	// 返回的每一行都带上它的**内容指纹**与已入库向量的指纹（没有则为空），
 	// 调用方据此判断"该不该重算"。这个判断刻意留在 Go 里而不是 SQL 里：
 	// 指纹算法一旦要改（比如把标签也算进内容版本），SQL 里的表达式
 	// 会与 Go 里的实现悄悄漂移，而漂移的后果是"该重算的没重算"。
-	ListEmbeddingTargets(ctx context.Context, model string, dim int, limit int) ([]EmbeddingTarget, error)
+	ListEmbeddingTargets(ctx context.Context, afterID uint, model string, dim int, limit int) ([]EmbeddingTarget, error)
+
+	// GetEmbeddingTarget 获取单条视频的待向量化目标状态。
+	GetEmbeddingTarget(ctx context.Context, videoID uint, model string, dim int) (*EmbeddingTarget, error)
 }
 
 // EmbeddingTarget 是一条"可能需要向量"的视频及其当前版本状态。
@@ -43,6 +47,7 @@ type EmbeddingTarget struct {
 	VideoID     uint
 	Title       string
 	Description string
+	CreateTime  time.Time
 	// CurrentHash 是这条视频此刻的内容指纹（由 v.Title/v.Description 算出）。
 	CurrentHash string
 	// StoredHash 是已入库向量的内容指纹；没有向量时为空串。
@@ -219,7 +224,7 @@ func (vr *VideoRepository) ListEmbeddingModels(ctx context.Context, dim int, lim
 // ORDER BY v.id 是刻意的：回填任务要能**分批推进**，而按主键排序
 // 让"处理到哪了"变成一个有意义的游标（LIMIT 越大越靠后）。
 // 按 updated_at 排序会让顺序随写入抖动，表现为同一条视频被反复处理。
-func (vr *VideoRepository) ListEmbeddingTargets(ctx context.Context, model string, dim int, limit int) ([]EmbeddingTarget, error) {
+func (vr *VideoRepository) ListEmbeddingTargets(ctx context.Context, afterID uint, model string, dim int, limit int) ([]EmbeddingTarget, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -227,13 +232,17 @@ func (vr *VideoRepository) ListEmbeddingTargets(ctx context.Context, model strin
 		ID          uint
 		Title       string
 		Description string
+		CreateTime  time.Time
 		StoredHash  string
 	}
-	err := vr.db.WithContext(ctx).
+	query := vr.db.WithContext(ctx).
 		Table("videos AS v").
-		Select("v.id, v.title, v.description, COALESCE(e.content_hash, '') AS stored_hash").
-		Joins("LEFT JOIN video_embeddings AS e ON e.video_id = v.id AND e.model = ? AND e.dim = ?", model, dim).
-		Order("v.id ASC").
+		Select("v.id, v.title, v.description, v.create_time, COALESCE(e.content_hash, '') AS stored_hash").
+		Joins("LEFT JOIN video_embeddings AS e ON e.video_id = v.id AND e.model = ? AND e.dim = ?", model, dim)
+	if afterID > 0 {
+		query = query.Where("v.id > ?", afterID)
+	}
+	err := query.Order("v.id ASC").
 		Limit(limit).
 		Scan(&rows).Error
 	if err != nil {
@@ -246,11 +255,46 @@ func (vr *VideoRepository) ListEmbeddingTargets(ctx context.Context, model strin
 			VideoID:     r.ID,
 			Title:       r.Title,
 			Description: r.Description,
+			CreateTime:  r.CreateTime,
 			CurrentHash: ContentHash(r.Title, r.Description),
 			StoredHash:  r.StoredHash,
 		})
 	}
 	return out, nil
+}
+
+// GetEmbeddingTarget 获取指定视频及其向量指纹状态。若视频不存在则返回 nil, nil。
+func (vr *VideoRepository) GetEmbeddingTarget(ctx context.Context, videoID uint, model string, dim int) (*EmbeddingTarget, error) {
+	if videoID == 0 {
+		return nil, errors.New("video: video_id 不能为空")
+	}
+	var row struct {
+		ID          uint
+		Title       string
+		Description string
+		CreateTime  time.Time
+		StoredHash  string
+	}
+	err := vr.db.WithContext(ctx).
+		Table("videos AS v").
+		Select("v.id, v.title, v.description, v.create_time, COALESCE(e.content_hash, '') AS stored_hash").
+		Joins("LEFT JOIN video_embeddings AS e ON e.video_id = v.id AND e.model = ? AND e.dim = ?", model, dim).
+		Where("v.id = ?", videoID).
+		Take(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &EmbeddingTarget{
+		VideoID:     row.ID,
+		Title:       row.Title,
+		Description: row.Description,
+		CreateTime:  row.CreateTime,
+		CurrentHash: ContentHash(row.Title, row.Description),
+		StoredHash:  row.StoredHash,
+	}, nil
 }
 
 // EmbeddingText 把标题与描述拼成喂给 embedding 模型的文本。

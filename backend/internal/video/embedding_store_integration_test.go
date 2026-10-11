@@ -309,7 +309,7 @@ func TestEmbeddingIntegrationStaleDetection(t *testing.T) {
 	db, repo := itestOpenRepo(t)
 	ctx := context.Background()
 
-	targets, err := repo.ListEmbeddingTargets(ctx, itestEmbedModel, 4, 1000)
+	targets, err := repo.ListEmbeddingTargets(ctx, 0, itestEmbedModel, 4, 1000)
 	if err != nil {
 		t.Fatalf("列出目标失败: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestEmbeddingIntegrationStaleDetection(t *testing.T) {
 		t.Fatalf("更新标题失败: %v", err)
 	}
 
-	targets, err = repo.ListEmbeddingTargets(ctx, itestEmbedModel, 4, 5000)
+	targets, err = repo.ListEmbeddingTargets(ctx, 0, itestEmbedModel, 4, 5000)
 	if err != nil {
 		t.Fatalf("列出目标失败: %v", err)
 	}
