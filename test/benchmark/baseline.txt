@@ -1,0 +1,63 @@
+goos: linux
+goarch: amd64
+pkg: github.com/handlerzzy/feedsystem/internal/video
+cpu: 12th Gen Intel(R) Core(TM) i7-12700H
+BenchmarkVectorPool_SearchCosine-20             	     669	   1797129 ns/op	   17983 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine-20             	     657	   1837623 ns/op	   17930 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine-20             	    1090	   1839929 ns/op	   17868 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine-20             	     714	   1726635 ns/op	   17864 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine-20             	     895	   2245461 ns/op	   17864 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine_Parallel-20    	    4447	    251171 ns/op	   17873 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine_Parallel-20    	    4200	    271741 ns/op	   17871 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine_Parallel-20    	    4622	    251946 ns/op	   17864 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine_Parallel-20    	    4747	    251917 ns/op	   17866 B/op	      16 allocs/op
+BenchmarkVectorPool_SearchCosine_Parallel-20    	    3786	    292415 ns/op	   17872 B/op	      16 allocs/op
+PASS
+ok  	github.com/handlerzzy/feedsystem/internal/video	21.732s
+goos: linux
+goarch: amd64
+pkg: github.com/handlerzzy/feedsystem/internal/feed
+cpu: 12th Gen Intel(R) Core(TM) i7-12700H
+BenchmarkCalculateLocalRerankScore_50Candidates-20    	  137955	      7552 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCalculateLocalRerankScore_50Candidates-20    	  164047	      7071 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCalculateLocalRerankScore_50Candidates-20    	  166812	      7030 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCalculateLocalRerankScore_50Candidates-20    	  112596	      9228 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCalculateLocalRerankScore_50Candidates-20    	  171289	      7103 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLocalRerankVideos_50Candidates-20            	   40621	     32531 ns/op	    2584 B/op	       5 allocs/op
+BenchmarkLocalRerankVideos_50Candidates-20            	   44594	     35399 ns/op	    2584 B/op	       5 allocs/op
+BenchmarkLocalRerankVideos_50Candidates-20            	   40058	     41975 ns/op	    2584 B/op	       5 allocs/op
+BenchmarkLocalRerankVideos_50Candidates-20            	   38908	     33347 ns/op	    2584 B/op	       5 allocs/op
+BenchmarkLocalRerankVideos_50Candidates-20            	   29388	     36367 ns/op	    2584 B/op	       5 allocs/op
+PASS
+ok  	github.com/handlerzzy/feedsystem/internal/feed	17.590s
+goos: linux
+goarch: amd64
+pkg: github.com/handlerzzy/feedsystem/internal/embed
+cpu: 12th Gen Intel(R) Core(TM) i7-12700H
+BenchmarkEncode_1536Dim/ShortTitle-20         	  296746	      5365 ns/op	    6533 B/op	      20 allocs/op
+BenchmarkEncode_1536Dim/ShortTitle-20         	  371750	      5255 ns/op	    6533 B/op	      20 allocs/op
+BenchmarkEncode_1536Dim/ShortTitle-20         	  201468	      6342 ns/op	    6533 B/op	      20 allocs/op
+BenchmarkEncode_1536Dim/ShortTitle-20         	  262057	      4912 ns/op	    6533 B/op	      20 allocs/op
+BenchmarkEncode_1536Dim/ShortTitle-20         	  219014	      5079 ns/op	    6533 B/op	      20 allocs/op
+BenchmarkEncode_1536Dim/TechnicalMedium-20    	   96606	     14204 ns/op	    6949 B/op	      53 allocs/op
+BenchmarkEncode_1536Dim/TechnicalMedium-20    	  111165	     14147 ns/op	    6949 B/op	      53 allocs/op
+BenchmarkEncode_1536Dim/TechnicalMedium-20    	  100096	     15253 ns/op	    6949 B/op	      53 allocs/op
+BenchmarkEncode_1536Dim/TechnicalMedium-20    	   96154	     11248 ns/op	    6949 B/op	      53 allocs/op
+BenchmarkEncode_1536Dim/TechnicalMedium-20    	  159452	      7219 ns/op	    6949 B/op	      53 allocs/op
+BenchmarkEncode_1536Dim/MixedLong-20          	  119182	      9575 ns/op	    7782 B/op	      84 allocs/op
+BenchmarkEncode_1536Dim/MixedLong-20          	  143322	      9515 ns/op	    7782 B/op	      84 allocs/op
+BenchmarkEncode_1536Dim/MixedLong-20          	  147381	      8280 ns/op	    7782 B/op	      84 allocs/op
+BenchmarkEncode_1536Dim/MixedLong-20          	  139959	      8412 ns/op	    7782 B/op	      84 allocs/op
+BenchmarkEncode_1536Dim/MixedLong-20          	  126523	      8235 ns/op	    7782 B/op	      84 allocs/op
+BenchmarkLexicalUnits-20                      	  290410	      4206 ns/op	     800 B/op	      52 allocs/op
+BenchmarkLexicalUnits-20                      	  267405	      6118 ns/op	     800 B/op	      52 allocs/op
+BenchmarkLexicalUnits-20                      	  175344	      6408 ns/op	     800 B/op	      52 allocs/op
+BenchmarkLexicalUnits-20                      	  221007	      6209 ns/op	     800 B/op	      52 allocs/op
+BenchmarkLexicalUnits-20                      	  223460	      5922 ns/op	     800 B/op	      52 allocs/op
+BenchmarkFNV1a-20                             	73028947	        19.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFNV1a-20                             	69575366	        16.53 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFNV1a-20                             	71671897	        16.64 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFNV1a-20                             	71636498	        18.76 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFNV1a-20                             	63669709	        16.80 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/handlerzzy/feedsystem/internal/embed	44.075s

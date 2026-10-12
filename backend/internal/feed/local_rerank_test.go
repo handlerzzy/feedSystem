@@ -151,10 +151,6 @@ func TestLocalRerankVideos_CorrectnessAndHangGuard(t *testing.T) {
 	}
 }
 
-// TestLocalRerankLatencyUnderSubMillisecond 保持向后兼容的测试入口别名。
-func TestLocalRerankLatencyUnderSubMillisecond(t *testing.T) {
-	TestLocalRerankVideos_CorrectnessAndHangGuard(t)
-}
 
 // TestLocalRerankSemanticHitsColdStartAndEdgeCases 验证无候选或少于 2 条时保持原样。
 func TestLocalRerankSemanticHitsColdStartAndEdgeCases(t *testing.T) {

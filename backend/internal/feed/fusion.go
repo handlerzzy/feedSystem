@@ -2,6 +2,7 @@ package feed
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/handlerzzy/feedsystem/internal/logging"
@@ -205,11 +206,22 @@ func (f *FeedService) exploreRecall(ctx context.Context, viewerAccountID uint, q
 	if quota.Explore <= 0 {
 		return nil
 	}
+	key := fmt.Sprintf("feed:explore:%d", viewerAccountID)
+	if f.localcache != nil {
+		if val, found := f.localcache.Get(key); found {
+			if fresh, ok := val.([]*video.Video); ok {
+				return fresh
+			}
+		}
+	}
 	fresh, err := f.repo.ListFreshLowEngagement(ctx, ExploreMaxCandidates, ExploreFreshness, ExploreMaxPopularity, viewerAccountID)
 	if err != nil {
 		logging.Ctx(ctx).Info("探索通道查询失败，本次不做冷启动兜底（不影响 Feed 结果）",
 			zap.Duration("freshness", ExploreFreshness), zap.Error(err))
 		return nil
+	}
+	if f.localcache != nil {
+		f.localcache.Set(key, fresh, 2*time.Second)
 	}
 	return fresh
 }

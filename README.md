@@ -106,10 +106,12 @@ TEST_RABBITMQ_URL='amqp://admin:password123@127.0.0.1:5672/' \
 - `TEST_MYSQL_DSN` 覆盖事务语义（回滚、幂等去重、`GREATEST` 兜底）——这类性质在 mock 上不成立，必须用真库。
 - `TEST_RABBITMQ_URL` 覆盖连接自愈（把已建立的连接弄死后能否重连）。
 
-仓库根目录另有两个脚本：
+仓库根目录另有测试与体检脚本：
 
 | 脚本 | 用途 | 依赖 |
 |------|------|------|
+| `./run_benchmark.sh` | 核心算法微基准测试（余弦检索、零逃逸本地精排、词法向量）Smoke 验证与基线比对审查 | 仅需 Go 环境（支持 `--smoke`, `--record`, `--compare`） |
+| `./run_load_test.sh` | 宏观全链路容器化并发压测（50 ➔ 200 ➔ 500 并发用户阶梯加压）与 SLA 延迟看板 | 需 Docker 集群网络（一键启动，零宿主依赖） |
 | `./e2e_regression.sh` | 端到端功能回归：注册 → 登录 → 发布 → outbox → 时间线 → 点赞 → 评论 → 通知，并校验错误契约与请求 id 贯穿 | 整套服务跑着（默认打 `127.0.0.1:8080`，可用 `BASE=` 改） |
 | `./verify.sh` | 只读「体检」：查索引、看执行计划、grep 代码，逐条给出 ✅/⚠️/❌ 与修法 | 只需要 MySQL（脚本头部那句 `docker compose up -d mysql redis rabbitmq` 是通用提示，实际不碰 Redis / RabbitMQ） |
 
@@ -120,7 +122,7 @@ TEST_RABBITMQ_URL='amqp://admin:password123@127.0.0.1:5672/' \
 
 GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Pull Request 以及推送到 `main`、`master` 时运行。
 
-- 后端：Go 1.24.x，执行 `go mod download`、`go vet ./...`、`go test -race -count=1 ./...`
+- 后端：Go 1.24.x，执行 `go mod download`、`go vet ./...`、`go test -race -count=1 ./...`、`go test -run='^$' -bench='^Benchmark' -benchmem -benchtime=1x ./...`（基准测试 Smoke 校验，保障核心算力基准测试签名完好且无崩溃）
 - 前端：Node.js 22，执行 `npm ci`、`npm run build`
 
 ## 接口清单

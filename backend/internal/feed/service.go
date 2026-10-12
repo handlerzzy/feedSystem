@@ -8,6 +8,7 @@ import (
 	rediscache "github.com/handlerzzy/feedsystem/internal/middleware/redis"
 	"github.com/handlerzzy/feedsystem/internal/video"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -121,14 +122,30 @@ type CachedFeedData struct {
 }
 
 func NewFeedService(repo FeedStore, likeRepo LikeLookup, rediscache *rediscache.Client) *FeedService {
+	var lc *cache.Cache
+	if os.Getenv("FEED_LOCAL_CACHE_ENABLED") != "false" {
+		lc = cache.New(3*time.Second, 5*time.Second)
+	}
 	return &FeedService{
 		repo:             repo,
 		likeRepo:         likeRepo,
 		rediscache:       rediscache,
-		localcache:       cache.New(3*time.Second, 5*time.Second),
+		localcache:       lc,
 		cacheTTL:         24 * time.Hour,
 		exposedFilterTTL: DefaultExposedFilterTTL,
 	}
+}
+
+// WithLocalCache 支持显式启用或禁用 L1 进程内本地缓存（便于压测对照与单元测试）。
+func (f *FeedService) WithLocalCache(enabled bool) *FeedService {
+	if enabled {
+		if f.localcache == nil {
+			f.localcache = cache.New(3*time.Second, 5*time.Second)
+		}
+	} else {
+		f.localcache = nil
+	}
+	return f
 }
 
 // WithSummaryLookup 注入 AI 摘要查询能力，返回自身以支持链式装配。
@@ -1362,6 +1379,55 @@ func (f *FeedService) buildFeedVideos(ctx context.Context, videos []*video.Video
 	return feedVideos, nil
 }
 
+// batchCacheAside 提供通用的批量 Cache-Aside 读穿透抽象：
+// 先查 localcache，收集未命中的 key，调用 fetcher 批量回源，最后回填 cache 并返回完整结果映射。
+// 当 localcache 为 nil 时，直接全量走 fetcher 回源。
+func batchCacheAside[K comparable, V any](
+	c *cache.Cache,
+	keys []K,
+	keyFn func(K) string,
+	ttl time.Duration,
+	fetcher func(missed []K) (map[K]V, error),
+) (map[K]V, error) {
+	out := make(map[K]V, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+
+	var missed []K
+	for _, k := range keys {
+		if c != nil {
+			if val, found := c.Get(keyFn(k)); found {
+				if typedVal, ok := val.(V); ok {
+					out[k] = typedVal
+					continue
+				}
+			}
+		}
+		missed = append(missed, k)
+	}
+
+	if len(missed) == 0 {
+		return out, nil
+	}
+
+	fetched, err := fetcher(missed)
+	if err != nil {
+		return out, err
+	}
+
+	for _, k := range missed {
+		if val, exists := fetched[k]; exists {
+			out[k] = val
+			if c != nil {
+				c.Set(keyFn(k), val, ttl)
+			}
+		}
+	}
+
+	return out, nil
+}
+
 // latestSummaries 批量取 AI 摘要。
 //
 // 三条刻意的设计：
@@ -1376,22 +1442,38 @@ func (f *FeedService) latestSummaries(ctx context.Context, videoIDs []uint) map[
 	if f.summaryRepo == nil || len(videoIDs) == 0 {
 		return nil
 	}
-	// 单独给一个短超时：摘要查询是可选路径，不该占用整个 Feed 请求的预算。
-	// 50ms 足够覆盖一次带索引的主键查询；超时就当作"没有摘要"。
-	opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancel()
 
-	summaries, err := f.summaryRepo.LatestAISummaries(opCtx, videoIDs)
-	if err != nil {
-		// 可选能力失败：不记 Warn 而是记 Debug？
-		// 这里选择 Warn 但只记一次摘要级别的原因：它确实代表"AI 摘要这条链路
-		// 出了问题"（表被删、库压力大），运维需要知道；而它不影响 Feed 结果，
-		// 所以不该是 Error。频率由 50ms 超时与索引保证，不会刷屏。
-		logging.Ctx(ctx).Warn("查询 AI 摘要失败，本次 Feed 不返回摘要（不影响 Feed 结果）",
-			zap.Int("videos", len(videoIDs)), zap.Error(err))
-		return nil
-	}
-	return summaries
+	out, _ := batchCacheAside(
+		f.localcache,
+		videoIDs,
+		func(id uint) string { return fmt.Sprintf("feed:summary:%d", id) },
+		10*time.Second,
+		func(missed []uint) (map[uint]string, error) {
+			// 单独给一个短超时：摘要查询是可选路径，不该占用整个 Feed 请求的预算。
+			// 50ms 足够覆盖一次带索引的主键查询；超时就当作"没有摘要"。
+			opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+			defer cancel()
+
+			summaries, err := f.summaryRepo.LatestAISummaries(opCtx, missed)
+			if err != nil {
+				// 可选能力失败：不记 Warn 而是记 Debug？
+				// 这里选择 Warn 但只记一次摘要级别的原因：它确实代表"AI 摘要这条链路
+				// 出了问题"（表被删、库压力大），运维需要知道；而它不影响 Feed 结果，
+				// 所以不该是 Error。频率由 50ms 超时与索引保证，不会刷屏。
+				logging.Ctx(ctx).Warn("查询 AI 摘要失败，本次 Feed 不返回摘要（不影响 Feed 结果）",
+					zap.Int("videos", len(videoIDs)), zap.Error(err))
+				return nil, err
+			}
+			valid := make(map[uint]string, len(summaries))
+			for id, s := range summaries {
+				if s != "" {
+					valid[id] = s
+				}
+			}
+			return valid, nil
+		},
+	)
+	return out
 }
 
 func buildOrderedResult(orderedIDs []uint, dataMap map[uint]*video.Video) []*video.Video {
@@ -1410,4 +1492,43 @@ func (f *FeedService) ListByTag(ctx context.Context, tagName string, limit int, 
 		return nil, err
 	}
 	return f.buildFeedVideos(ctx, videos, viewerAccountID)
+}
+
+func (f *FeedService) recentLikedVideoIDs(ctx context.Context, accountID uint, limit int) ([]uint, error) {
+	if f.vectorStore == nil || accountID == 0 || limit <= 0 {
+		return nil, nil
+	}
+	key := fmt.Sprintf("feed:liked_ids:%d:%d", accountID, limit)
+	if f.localcache != nil {
+		if val, found := f.localcache.Get(key); found {
+			if ids, ok := val.([]uint); ok {
+				return ids, nil
+			}
+		}
+	}
+	ids, err := f.vectorStore.RecentLikedVideoIDs(ctx, accountID, limit)
+	if err != nil {
+		return nil, err
+	}
+	if f.localcache != nil {
+		f.localcache.Set(key, ids, 3*time.Second)
+	}
+	return ids, nil
+}
+
+func (f *FeedService) videoTagNames(ctx context.Context, videoIDs []uint) (map[uint][]string, error) {
+	return batchCacheAside(
+		f.localcache,
+		videoIDs,
+		func(id uint) string { return fmt.Sprintf("feed:tags:%d", id) },
+		10*time.Second,
+		func(missed []uint) (map[uint][]string, error) {
+			if f.reasonSignals != nil {
+				return f.reasonSignals.VideoTagNames(ctx, missed)
+			} else if lister, ok := f.repo.(ReasonSignalLookup); ok {
+				return lister.VideoTagNames(ctx, missed)
+			}
+			return nil, nil
+		},
+	)
 }

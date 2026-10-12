@@ -40,6 +40,9 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
+      - name: Benchmark Smoke Test
+        run: go test -run='^$' -bench='^Benchmark' -benchmem -benchtime=1x ./...
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest

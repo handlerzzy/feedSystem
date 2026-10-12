@@ -98,7 +98,7 @@ func (f *FeedService) semanticRecall(ctx context.Context, viewerAccountID uint, 
 	defer cancel()
 
 	// 1. 获取用户近期点赞的视频 ID 列表
-	likedIDs, err := f.vectorStore.RecentLikedVideoIDs(opCtx, viewerAccountID, UserProfileLikes)
+	likedIDs, err := f.recentLikedVideoIDs(opCtx, viewerAccountID, UserProfileLikes)
 	if err != nil {
 		f.logSemanticDegrade(ctx, "读取用户点赞历史失败，语义路本次关闭", err)
 		return nil
@@ -252,7 +252,7 @@ func (f *FeedService) userInterestVector(ctx context.Context, accountID uint) ([
 	if f.vectorStore == nil {
 		return nil, nil
 	}
-	likedIDs, err := f.vectorStore.RecentLikedVideoIDs(ctx, accountID, UserProfileLikes)
+	likedIDs, err := f.recentLikedVideoIDs(ctx, accountID, UserProfileLikes)
 	if err != nil {
 		return nil, err
 	}
@@ -329,13 +329,7 @@ func (f *FeedService) roughSelectLongTailCandidates(ctx context.Context, likedID
 	}
 
 	// 1. 获取点赞视频的标签列表
-	var tagMap map[uint][]string
-	var err error
-	if f.reasonSignals != nil {
-		tagMap, err = f.reasonSignals.VideoTagNames(ctx, likedIDs)
-	} else if lister, ok := f.repo.(ReasonSignalLookup); ok {
-		tagMap, err = lister.VideoTagNames(ctx, likedIDs)
-	}
+	tagMap, err := f.videoTagNames(ctx, likedIDs)
 	if err != nil || len(tagMap) == 0 {
 		return nil, nil
 	}

@@ -85,8 +85,11 @@ services:
       # 用同一个变量喂三个服务，是为了让"不一致"在结构上不可能发生。
       AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-text-embedding-3-small}
       AI_EMBEDDING_DIM: ${AI_EMBEDDING_DIM:-1536}
+      # 读链路 L1 本地缓存开关（支持压测与基准对照，默认开启）
+      FEED_LOCAL_CACHE_ENABLED: ${FEED_LOCAL_CACHE_ENABLED:-true}
     ports:
       - "8080:8080"
+      - "6060:6060"
     volumes:
       - ./backend/configs/config.docker.yaml:/app/configs/config.yaml:ro
       - backend_uploads:/app/.run/uploads

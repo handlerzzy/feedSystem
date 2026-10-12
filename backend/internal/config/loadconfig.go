@@ -522,6 +522,19 @@ func ApplyEnvOverrides(cfg *Config) []string {
 	if v := os.Getenv("AI_EMBEDDING_DIM"); v != "" {
 		atoi("AI_EMBEDDING_DIM", v, &cfg.AI.EmbeddingDim)
 	}
+	if v := os.Getenv("PPROF_ENABLED"); v != "" {
+		if enabled, ok := parseBoolLoose(v); ok {
+			cfg.ObservabilityConfig.Pprof.Enabled = enabled
+		} else {
+			ignored = append(ignored, fmt.Sprintf("PPROF_ENABLED=%s", v))
+		}
+	}
+	if v := os.Getenv("PPROF_API_ADDR"); v != "" {
+		cfg.ObservabilityConfig.Pprof.ApiAddr = v
+	}
+	if v := os.Getenv("PPROF_WORKER_ADDR"); v != "" {
+		cfg.ObservabilityConfig.Pprof.WorkerAddr = v
+	}
 	return ignored
 }
 

@@ -2,7 +2,9 @@
 backend/.run/
 data/
 .sisyphus/
-docs/
+# docs/ 目录允许版本控制（ADR, guide 与设计规范）
+!docs/
+!docs/**
 AGENTS.md
 .scratch/
 GLOSSARY.md
@@ -66,3 +68,10 @@ ai-usage.jsonl
 # Editor/IDE
 .idea/
 .vscode/
+
+# 压测运行时产物与临时凭据
+test/load/tokens.json
+test/load/seedload
+test/load/summary.json
+test/load/summary.md
+test/load/profiles/

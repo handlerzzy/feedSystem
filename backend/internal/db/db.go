@@ -23,9 +23,15 @@ func NewDB(dbcfg config.DatabaseConfig) (*gorm.DB, error) {
 		// 绕过 zap.RedirectStdLog，且会把每条 SQL 与参数无条件打进日志。
 		Logger: newGormLogger(gormLevelForAppLog(), 200*time.Millisecond, true),
 	})
+	sqlDB, err := db.DB()
 	if err != nil {
 		return nil, err
 	}
+	// 配置连接池参数，防止高并发下短连接频繁创建销毁导致 TIME_WAIT 端口耗尽 (cannot assign requested address)
+	sqlDB.SetMaxIdleConns(100)
+	sqlDB.SetMaxOpenConns(300)
+	sqlDB.SetConnMaxLifetime(time.Hour)
+	sqlDB.SetConnMaxIdleTime(10 * time.Minute)
 
 	return db, nil
 }

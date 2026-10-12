@@ -718,10 +718,6 @@ func TestSemanticRecall_SearchCosine_CorrectnessAndHangGuard(t *testing.T) {
 	}
 }
 
-// TestSemanticRecallLatencyUnder2ms 保持向后兼容的测试入口别名。
-func TestSemanticRecallLatencyUnder2ms(t *testing.T) {
-	TestSemanticRecall_SearchCosine_CorrectnessAndHangGuard(t)
-}
 
 // TestSemanticRecallColdStartAndDegradation 验证未登录、无点赞或空向量池时静默返回 nil（Ticket 03 AC 4）。
 func TestSemanticRecallColdStartAndDegradation(t *testing.T) {

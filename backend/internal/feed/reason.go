@@ -102,7 +102,7 @@ func (f *FeedService) newReasonBuilder(ctx context.Context, videos []*video.Vide
 		for _, v := range videos {
 			ids = append(ids, v.ID)
 		}
-		tags, err := f.reasonSignals.VideoTagNames(opCtx, ids)
+		tags, err := f.videoTagNames(opCtx, ids)
 		if err != nil {
 			logging.Ctx(ctx).Warn("查询视频标签失败，本次不生成基于标签的推荐理由（不影响 Feed 结果）",
 				zap.Int("videos", len(ids)), zap.Error(err))
@@ -127,7 +127,7 @@ func (f *FeedService) userInterestTags(ctx context.Context, accountID uint) map[
 		// ——后者可能成千上万条。
 		return nil
 	}
-	likedIDs, err := f.vectorStore.RecentLikedVideoIDs(ctx, accountID, reasonProfileLikes)
+	likedIDs, err := f.recentLikedVideoIDs(ctx, accountID, reasonProfileLikes)
 	if err != nil {
 		logging.Ctx(ctx).Warn("查询用户点赞历史失败，本次不生成兴趣理由（不影响 Feed 结果）",
 			zap.Uint("account_id", accountID), zap.Error(err))
@@ -136,7 +136,7 @@ func (f *FeedService) userInterestTags(ctx context.Context, accountID uint) map[
 	if len(likedIDs) == 0 {
 		return nil
 	}
-	tags, err := f.reasonSignals.VideoTagNames(ctx, likedIDs)
+	tags, err := f.videoTagNames(ctx, likedIDs)
 	if err != nil {
 		logging.Ctx(ctx).Warn("查询点赞视频标签失败，本次不生成兴趣理由（不影响 Feed 结果）",
 			zap.Int("videos", len(likedIDs)), zap.Error(err))

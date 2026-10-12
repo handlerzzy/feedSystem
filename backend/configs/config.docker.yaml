@@ -22,9 +22,9 @@ rabbitmq:
 
 observability:
   pprof:
-    enabled: false
-    api_addr: localhost:6060
-    worker_addr: localhost:6061
+    enabled: true
+    api_addr: :6060
+    worker_addr: :6061
 
 # ---- AI 能力（全部可选；删掉整个 ai: 段服务照常启动）----
 #

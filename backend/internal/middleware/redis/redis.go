@@ -18,7 +18,19 @@ type Client struct {
 	keyPrefix string
 }
 
-const defaultKeyPrefix = "v1:"
+const DefaultKeyPrefix = "v1:"
+const AccountKeyPattern = "account:%d"
+const FeedGlobalTimelineKey = "feed:global_timeline"
+
+// AccountKey 返回默认前缀下的用户 Token 缓存键
+func AccountKey(accountID uint) string {
+	return DefaultKeyPrefix + fmt.Sprintf(AccountKeyPattern, accountID)
+}
+
+// GlobalTimelineKey 返回默认前缀下的全局时间线缓存键
+func GlobalTimelineKey() string {
+	return DefaultKeyPrefix + FeedGlobalTimelineKey
+}
 
 func NewClient(rdb *redis.Client, keyPrefix string) *Client {
 	return &Client{rdb: rdb, keyPrefix: keyPrefix}
@@ -30,7 +42,7 @@ func NewFromEnv(cfg *config.RedisConfig) (*Client, error) {
 		Password: cfg.Password,
 		DB:       cfg.DB,
 	})
-	return &Client{rdb: rdb, keyPrefix: defaultKeyPrefix}, nil
+	return &Client{rdb: rdb, keyPrefix: DefaultKeyPrefix}, nil
 }
 
 func (c *Client) Close() error {
@@ -57,6 +69,16 @@ func (c *Client) Key(format string, args ...any) string {
 		prefix = c.keyPrefix
 	}
 	return prefix + fmt.Sprintf(format, args...)
+}
+
+// AccountKey 基于当前客户端配置的 keyPrefix 返回账号缓存键
+func (c *Client) AccountKey(accountID uint) string {
+	return c.Key(AccountKeyPattern, accountID)
+}
+
+// GlobalTimelineKey 基于当前客户端配置的 keyPrefix 返回全局时间线缓存键
+func (c *Client) GlobalTimelineKey() string {
+	return c.Key(FeedGlobalTimelineKey)
 }
 
 func randToken(n int) (string, error) {
