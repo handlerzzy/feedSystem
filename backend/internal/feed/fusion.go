@@ -222,24 +222,36 @@ func (f *FeedService) exploreRecall(ctx context.Context, viewerAccountID uint, q
 		return nil
 	}
 
-	// 1. 严格过滤未审核与驳回的违规内容，公域探索槽位仅保留已发布视频
-	published := make([]*video.Video, 0, len(fresh))
+	// 1. 防御性过滤非 published 内容（就地切片复用，零额外内存分配）
+	n := 0
+	needSort := false
+	sawNonSeed := false
 	for _, v := range fresh {
 		if v != nil && v.Status == video.VideoStatusPublished {
-			published = append(published, v)
+			fresh[n] = v
+			n++
+			if v.PoolLevel == video.PoolLevelSeed {
+				if sawNonSeed {
+					needSort = true
+				}
+			} else {
+				sawNonSeed = true
+			}
 		}
 	}
-	fresh = published
+	fresh = fresh[:n]
 
-	// 2. 优先提取 pool_level = 1 种子视频注入探索槽位，精准赋能冷启动试水曝光
-	sort.SliceStable(fresh, func(i, j int) bool {
-		iSeed := fresh[i].PoolLevel == video.PoolLevelSeed
-		jSeed := fresh[j].PoolLevel == video.PoolLevelSeed
-		if iSeed != jSeed {
-			return iSeed
-		}
-		return false
-	})
+	// 2. 仅在发现未排序时执行重排（SQL 层面已预先排序，通常直接跳过避免多余开销）
+	if needSort {
+		sort.SliceStable(fresh, func(i, j int) bool {
+			iSeed := fresh[i].PoolLevel == video.PoolLevelSeed
+			jSeed := fresh[j].PoolLevel == video.PoolLevelSeed
+			if iSeed != jSeed {
+				return iSeed
+			}
+			return false
+		})
+	}
 
 	if f.localcache != nil {
 		f.localcache.Set(key, fresh, 2*time.Second)

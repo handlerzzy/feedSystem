@@ -72,16 +72,16 @@ func FormatPromotionMessage(title string, videoID uint) string {
 
 // SettlementResult 记录单个候选视频赛马结算的裁决结果与执行状态。
 type SettlementResult struct {
-	VideoID         uint    `json:"video_id"`
-	AuthorID        uint    `json:"author_id"`
-	Impressions     int64   `json:"impressions"`
-	Likes           int64   `json:"likes"`
-	Comments        int64   `json:"comments"`
-	Score           float64 `json:"score"`
-	TargetPoolLevel int     `json:"target_pool_level"`
-	Promoted        bool    `json:"promoted"`
-	CasSucceeded    bool    `json:"cas_succeeded"`
-	Reason          string  `json:"reason"`
+	VideoID         uint            `json:"video_id"`
+	AuthorID        uint            `json:"author_id"`
+	Impressions     int64           `json:"impressions"`
+	Likes           int64           `json:"likes"`
+	Comments        int64           `json:"comments"`
+	Score           float64         `json:"score"`
+	TargetPoolLevel video.PoolLevel `json:"target_pool_level"`
+	Promoted        bool            `json:"promoted"`
+	CasSucceeded    bool            `json:"cas_succeeded"`
+	Reason          string          `json:"reason"`
 }
 
 // TrafficPoolWorker 是阶梯流量池赛马调度引擎，负责定期巡检活跃候选队列并执行双触发结算。
@@ -187,14 +187,17 @@ func (w *TrafficPoolWorker) removeCandidate(ctx context.Context, videoID uint) {
 }
 
 // executeCASUpdate 采用 GORM 执行 CAS 乐观更新:
-// UPDATE videos SET pool_level = ? WHERE id = ? AND pool_level = 1
-func (w *TrafficPoolWorker) executeCASUpdate(ctx context.Context, videoID uint, targetPoolLevel int) (bool, error) {
+// UPDATE videos SET pool_level = ?, update_time = ? WHERE id = ? AND pool_level = 1
+func (w *TrafficPoolWorker) executeCASUpdate(ctx context.Context, videoID uint, targetPoolLevel video.PoolLevel) (bool, error) {
 	if w.db == nil {
 		return false, errors.New("db not initialized")
 	}
 	res := w.db.WithContext(ctx).Model(&video.Video{}).
 		Where("id = ? AND pool_level = ?", videoID, video.PoolLevelSeed).
-		Update("pool_level", targetPoolLevel)
+		Updates(map[string]interface{}{
+			"pool_level":  targetPoolLevel,
+			"update_time": w.now(),
+		})
 	if res.Error != nil {
 		return false, res.Error
 	}
@@ -301,6 +304,18 @@ func (w *TrafficPoolWorker) SettleBatch(ctx context.Context) (int, error) {
 		}
 	}
 
+	// 3. 兜底巡检：查询创建时间超过 24 小时但仍停留在种子池中的视频，彻底防止 0 曝光长尾死锁
+	deadlineTime := w.now().Add(-w.deadlineDuration)
+	var expiredDBIDs []uint
+	if err := w.db.WithContext(ctx).Model(&video.Video{}).
+		Where("pool_level = ? AND create_time <= ?", video.PoolLevelSeed, deadlineTime).
+		Limit(int(limit)).
+		Pluck("id", &expiredDBIDs).Error; err == nil {
+		for _, id := range expiredDBIDs {
+			eligibleSet[id] = struct{}{}
+		}
+	}
+
 	if len(eligibleSet) == 0 {
 		return 0, nil
 	}
@@ -404,32 +419,42 @@ func (w *TrafficPoolWorker) SettleCandidates(ctx context.Context, videoIDs []uin
 		score := CalculateLaplaceScore(likes, comments, impressions)
 
 		// 判定目标 pool_level 与裁决原因
-		targetLevel := -1 // -1 表示仍在赛马观察期，暂不跃迁
+		var targetLevel video.PoolLevel = -1 // -1 表示仍在赛马观察期，暂不跃迁
 		reason := ""
 
-		if impressions >= w.racingExposureThreshold {
-			// 条件 A: 赛马有效曝光达标 (>= 200) -> 试水赛马周期结束，实施二元裁决（>= 3% 晋升进阶池，< 3% 沉底淘汰）
-			if score >= w.promotionScoreThreshold {
-				targetLevel = video.PoolLevelAdvanced
-				reason = "racing_promoted"
-			} else {
-				targetLevel = video.PoolLevelSettled
-				reason = "racing_sunk"
-			}
-		} else if now.Sub(v.CreateTime) >= w.deadlineDuration {
-			// 条件 B: 满 24 小时兜底裁决
+		if now.Sub(v.CreateTime) >= w.deadlineDuration {
+			// 条件 B: 满 24 小时兜底裁决（生存周期到期）
 			if impressions < w.deadlineExposureMin {
-				// 曝光不足 50 次，判定为低潜淘汰
-				targetLevel = video.PoolLevelSettled
+				// 曝光不足 50 次，判定为低潜淘汰沉底
+				targetLevel = video.PoolLevelSunk
 				reason = "deadline_exposure_insufficient"
 			} else if score >= w.promotionScoreThreshold {
-				// 曝光 >= 50 且平滑分 >= 3% 破格晋升
+				// 曝光 >= 50 且平滑分 >= 3% 破格晋升（若有效曝光达标则为赛马达标晋升）
 				targetLevel = video.PoolLevelAdvanced
-				reason = "deadline_promoted"
+				if impressions >= w.racingExposureThreshold {
+					reason = "racing_promoted"
+				} else {
+					reason = "deadline_promoted"
+				}
 			} else {
-				// 曝光 >= 50 但评分未达标，温和沉底
-				targetLevel = video.PoolLevelSettled
+				// 曝光 >= 50 但评分未达 3%，温和沉底
+				targetLevel = video.PoolLevelSunk
 				reason = "deadline_low_potential"
+			}
+		} else if impressions >= w.racingExposureThreshold {
+			// 条件 A: 未满 24 小时但有效曝光达标 (>= 200) -> 依据 3% 晋升线与 0.8% 沉底线进行三态裁决
+			if score >= w.promotionScoreThreshold {
+				// Score >= 3% -> 跃迁至进阶池
+				targetLevel = video.PoolLevelAdvanced
+				reason = "racing_promoted"
+			} else if score < w.sinkScoreThreshold {
+				// Score < 0.8% -> 极低互动提前沉底淘汰
+				targetLevel = video.PoolLevelSunk
+				reason = "racing_sunk"
+			} else {
+				// 0.8% <= Score < 3.0% -> 仍在探索观察期，保留在种子池继续赛马观察
+				targetLevel = -1
+				reason = "in_observation_window"
 			}
 		}
 
@@ -450,12 +475,12 @@ func (w *TrafficPoolWorker) SettleCandidates(ctx context.Context, videoIDs []uin
 			continue
 		}
 
-		// 执行 MySQL CAS 乐观更新: UPDATE videos SET pool_level = ? WHERE id = ? AND pool_level = 1
+		// 执行 MySQL CAS 乐观更新: UPDATE videos SET pool_level = ?, update_time = ? WHERE id = ? AND pool_level = 1
 		casSucceeded, err := w.executeCASUpdate(ctx, v.ID, targetLevel)
 		if err != nil {
 			logging.Ctx(ctx).Error("execute CAS update failed",
 				zap.Uint("video_id", v.ID),
-				zap.Int("target_level", targetLevel),
+				zap.Int("target_level", int(targetLevel)),
 				zap.Error(err))
 			continue
 		}

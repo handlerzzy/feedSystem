@@ -191,6 +191,9 @@ func TestTrafficPoolWorker_CAS_SQLGeneration(t *testing.T) {
 			if !strings.Contains(q, "pool_level` = 1") && !strings.Contains(q, "pool_level = 1") && !strings.Contains(q, "pool_level` = ?") {
 				t.Errorf("CAS update missing pool_level = 1 condition: %s", q)
 			}
+			if !strings.Contains(q, "update_time") {
+				t.Errorf("CAS update missing update_time column: %s", q)
+			}
 		}
 	}
 
@@ -378,18 +381,18 @@ func TestTrafficPoolWorker_SettleCandidates_Thresholds(t *testing.T) {
 	if !resB.CasSucceeded {
 		t.Errorf("vB CasSucceeded = false, want true")
 	}
-	if resB.TargetPoolLevel != video.PoolLevelSettled {
-		t.Errorf("vB TargetPoolLevel = %d, want %d", resB.TargetPoolLevel, video.PoolLevelSettled)
+	if resB.TargetPoolLevel != video.PoolLevelSunk {
+		t.Errorf("vB TargetPoolLevel = %d, want %d", resB.TargetPoolLevel, video.PoolLevelSunk)
 	}
 	if resB.Promoted {
 		t.Errorf("vB Promoted = true, want false")
 	}
 
-	// 验证 DB 状态更新为 0
+	// 验证 DB 状态更新为 0 (Sunk)
 	var checkB video.Video
 	db.First(&checkB, videoIDB)
-	if checkB.PoolLevel != video.PoolLevelSettled {
-		t.Errorf("DB vB PoolLevel = %d, want %d", checkB.PoolLevel, video.PoolLevelSettled)
+	if checkB.PoolLevel != video.PoolLevelSunk {
+		t.Errorf("DB vB PoolLevel = %d, want %d", checkB.PoolLevel, video.PoolLevelSunk)
 	}
 
 	// 验证绝未向作者 102 发送喜报 (依然只有之前视频 A 的 1 次)
@@ -437,12 +440,12 @@ func TestTrafficPoolWorker_SettleCandidates_Thresholds(t *testing.T) {
 		t.Errorf("DB vC PoolLevel = %d, want %d (仍保留在种子池)", checkC.PoolLevel, video.PoolLevelSeed)
 	}
 
-	// 4. 视频 D：有效曝光 200 (满配额)，1 赞 0 评 -> 互动分 = 3/220 ≈ 1.36% (< 3% 晋升门槛) -> 赛马结束未达标，沉底淘汰至 Level 0
+	// 4. 视频 D：有效曝光 200 (满配额)，1 赞 0 评 -> 互动分 = 3/220 ≈ 1.36% (介于 0.8% 与 3% 之间，未满 24 小时) -> 仍在探索观察期，保留在种子池继续赛马观察
 	const videoIDD = uint(88004)
 	vD := video.Video{
 		ID:         videoIDD,
 		AuthorID:   104,
-		Title:      "配额耗尽未晋升视频D",
+		Title:      "观察期继续试水视频D",
 		Status:     video.VideoStatusPublished,
 		PoolLevel:  video.PoolLevelSeed,
 		CreateTime: time.Now().Add(-2 * time.Hour),
@@ -460,19 +463,17 @@ func TestTrafficPoolWorker_SettleCandidates_Thresholds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SettleVideo(vD) failed: %v", err)
 	}
-	if !resD.CasSucceeded || resD.TargetPoolLevel != video.PoolLevelSettled {
-		t.Errorf("vD should sink to Level 0 upon completing 200 impressions without passing 3%%: %+v", resD)
+	if resD.CasSucceeded || resD.TargetPoolLevel != video.PoolLevelSeed || resD.Reason != "in_observation_window" {
+		t.Errorf("vD should remain in observation window (Level 1) when score in [0.8%%, 3%%) and age < 24h: %+v", resD)
 	}
 	var checkD video.Video
 	db.First(&checkD, videoIDD)
-	if checkD.PoolLevel != video.PoolLevelSettled {
-		t.Errorf("DB vD PoolLevel = %d, want %d", checkD.PoolLevel, video.PoolLevelSettled)
+	if checkD.PoolLevel != video.PoolLevelSeed {
+		t.Errorf("DB vD PoolLevel = %d, want %d (仍保留在种子池)", checkD.PoolLevel, video.PoolLevelSeed)
 	}
-	zmembers, _ := mr.ZMembers(candidatesKey)
-	for _, m := range zmembers {
-		if m == strconv.FormatUint(uint64(videoIDD), 10) {
-			t.Errorf("video D should be removed from Redis candidates ZSet, but still present in %v", zmembers)
-		}
+	// 验证仍在候选队列
+	if score, err := mr.ZScore(candidatesKey, strconv.FormatUint(uint64(videoIDD), 10)); err != nil || score != 200 {
+		t.Errorf("video D should remain in Redis candidates ZSet with score 200, but got score=%f, err=%v", score, err)
 	}
 }
 
@@ -512,7 +513,7 @@ func TestTrafficPoolWorker_24hDeadlineFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("settle vLow failed: %v", err)
 	}
-	if !res1.CasSucceeded || res1.TargetPoolLevel != video.PoolLevelSettled {
+	if !res1.CasSucceeded || res1.TargetPoolLevel != video.PoolLevelSunk {
 		t.Errorf("vLow should sink to Level 0: %+v", res1)
 	}
 
@@ -538,7 +539,7 @@ func TestTrafficPoolWorker_24hDeadlineFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("settle vLowScore failed: %v", err)
 	}
-	if !res2.CasSucceeded || res2.TargetPoolLevel != video.PoolLevelSettled {
+	if !res2.CasSucceeded || res2.TargetPoolLevel != video.PoolLevelSunk {
 		t.Errorf("vLowScore should sink to Level 0: %+v", res2)
 	}
 
@@ -744,4 +745,101 @@ func BenchmarkCalculateLaplaceScore(b *testing.B) {
 	}
 	_ = dummy
 }
+
+// ---------- 观察期机制与 0 曝光长尾视频 24h 兜底测试 ----------
+
+func TestTrafficPoolWorker_ObservationWindowAndZeroExposureFallback(t *testing.T) {
+	db := openWorkerIntegrationDB(t)
+	cache, mr := setupTestRedis(t)
+	broadcaster := &mockBroadcaster{}
+
+	worker := NewTrafficPoolWorker(db, cache, broadcaster)
+	ctx := context.Background()
+	candidatesKey := cache.Key("feed:racing:candidates")
+
+	baseTime := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+
+	t.Run("0.8%~3.0% 观察期在 24h 前后状态跃迁对比", func(t *testing.T) {
+		const vidObs = uint(88501)
+		vObs := video.Video{
+			ID:         vidObs,
+			AuthorID:   501,
+			Title:      "观察期视频",
+			Status:     video.VideoStatusPublished,
+			PoolLevel:  video.PoolLevelSeed,
+			CreateTime: baseTime,
+			LikesCount: 1, // Score = 3 / 220 = 1.36% (0.8% <= Score < 3.0%)
+		}
+		db.Where("id = ?", vidObs).Delete(&video.Video{})
+		if err := db.Create(&vObs).Error; err != nil {
+			t.Fatalf("create vObs failed: %v", err)
+		}
+		t.Cleanup(func() { db.Where("id = ?", vidObs).Delete(&video.Video{}) })
+
+		mr.ZAdd(candidatesKey, 200, strconv.FormatUint(uint64(vidObs), 10))
+
+		// 阶段 1: 发布仅 2 小时 (未到期)，曝光达标 200 次 -> 必须保留在种子池观察期
+		worker.WithClock(func() time.Time { return baseTime.Add(2 * time.Hour) })
+		resEarly, err := worker.SettleVideo(ctx, vidObs)
+		if err != nil {
+			t.Fatalf("early settle failed: %v", err)
+		}
+		if resEarly.CasSucceeded || resEarly.TargetPoolLevel != video.PoolLevelSeed || resEarly.Reason != "in_observation_window" {
+			t.Fatalf("expected observation window at 2h, got: %+v", resEarly)
+		}
+
+		// 阶段 2: 发布满 25 小时 (已到期)，曝光 200 次，平滑分 1.36% 未达到 3% -> 兜底沉底
+		worker.WithClock(func() time.Time { return baseTime.Add(25 * time.Hour) })
+		resLate, err := worker.SettleVideo(ctx, vidObs)
+		if err != nil {
+			t.Fatalf("late settle failed: %v", err)
+		}
+		if !resLate.CasSucceeded || resLate.TargetPoolLevel != video.PoolLevelSunk || resLate.Reason != "deadline_low_potential" {
+			t.Fatalf("expected deadline low potential sink at 25h, got: %+v", resLate)
+		}
+
+		// 验证 DB 更新为 PoolLevelSunk
+		var check video.Video
+		db.First(&check, vidObs)
+		if check.PoolLevel != video.PoolLevelSunk {
+			t.Fatalf("expected DB pool_level = %d, got %d", video.PoolLevelSunk, check.PoolLevel)
+		}
+	})
+
+	t.Run("0 曝光长尾视频在未入 Redis 时通过 SettleBatch 兜底巡检沉底", func(t *testing.T) {
+		const vidZero = uint(88502)
+		vZero := video.Video{
+			ID:         vidZero,
+			AuthorID:   502,
+			Title:      "0曝光长尾视频",
+			Status:     video.VideoStatusPublished,
+			PoolLevel:  video.PoolLevelSeed,
+			CreateTime: baseTime,
+			LikesCount: 0,
+		}
+		db.Where("id = ?", vidZero).Delete(&video.Video{})
+		if err := db.Create(&vZero).Error; err != nil {
+			t.Fatalf("create vZero failed: %v", err)
+		}
+		t.Cleanup(func() { db.Where("id = ?", vidZero).Delete(&video.Video{}) })
+
+		// 注意：故意不将该视频加入 Redis ZSet (模拟 0 曝光视频未触发写入)
+		worker.WithClock(func() time.Time { return baseTime.Add(25 * time.Hour) })
+
+		settledCount, err := worker.SettleBatch(ctx)
+		if err != nil {
+			t.Fatalf("SettleBatch failed: %v", err)
+		}
+		if settledCount < 1 {
+			t.Fatalf("expected at least 1 settled video from 24h DB sweep, got %d", settledCount)
+		}
+
+		var checkZero video.Video
+		db.First(&checkZero, vidZero)
+		if checkZero.PoolLevel != video.PoolLevelSunk {
+			t.Fatalf("expected 0-exposure video to sink to %d, got %d", video.PoolLevelSunk, checkZero.PoolLevel)
+		}
+	})
+}
+
 

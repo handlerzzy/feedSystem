@@ -158,12 +158,13 @@ function getVideoBadge(v: Video): { text: string; className: string } | null {
   }
   if (v.status === 'published') {
     if (v.pool_level === 1) {
-      return { text: '🌱 种子池扶持中', className: 'badge-seed' }
+      const impr = v.racing_impressions ?? 0
+      return { text: `🌱 种子池扶持中 (${impr}/200)`, className: 'badge-seed' }
     }
     if (v.pool_level === 2) {
       return { text: '🔥 进阶爆款', className: 'badge-advanced' }
     }
-    return { text: '📦 已结算', className: 'badge-settled' }
+    return { text: '📦 已沉底', className: 'badge-sunk' }
   }
   return null
 }
@@ -474,6 +475,7 @@ onUnmounted(() => {
   box-shadow: 0 0 10px rgba(249, 115, 22, 0.5);
 }
 
+.badge-sunk,
 .badge-settled {
   background: rgba(100, 116, 139, 0.85);
   color: #f1f5f9;

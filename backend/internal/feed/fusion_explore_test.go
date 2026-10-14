@@ -26,11 +26,11 @@ func (s *fakeExploreStore) ListFreshLowEngagement(context.Context, int, time.Dur
 }
 
 func TestExploreRecallPrioritizesSeedPoolAndFiltersNonPublished(t *testing.T) {
-	vSettled := &video.Video{ID: 101, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSettled}
+	vSettled := &video.Video{ID: 101, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSunk}
 	vSeed1 := &video.Video{ID: 102, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSeed}
 	vAdvanced := &video.Video{ID: 103, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelAdvanced}
 	vSeed2 := &video.Video{ID: 104, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSeed}
-	vRejected := &video.Video{ID: 105, Status: video.VideoStatusRejected, PoolLevel: video.PoolLevelSettled}
+	vRejected := &video.Video{ID: 105, Status: video.VideoStatusRejected, PoolLevel: video.PoolLevelSunk}
 	vAuditing := &video.Video{ID: 106, Status: video.VideoStatusAuditing, PoolLevel: video.PoolLevelSeed}
 
 	// 模拟 repo 返回未按 pool_level 排序且混杂未审核/驳回数据的原始列表
@@ -77,7 +77,7 @@ func TestFusionExploreSlotSeedPoolPriority(t *testing.T) {
 	base := fuseVideos(20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
 	plan := buildQuotaPlan(20, 0, 0.1) // 2 探索位 (20 * 0.1 = 2)
 
-	vSettled := &video.Video{ID: 201, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSettled}
+	vSettled := &video.Video{ID: 201, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSunk}
 	vSeed1 := &video.Video{ID: 202, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSeed}
 	vSeed2 := &video.Video{ID: 203, Status: video.VideoStatusPublished, PoolLevel: video.PoolLevelSeed}
 

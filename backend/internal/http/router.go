@@ -180,9 +180,8 @@ func SetRouter(deps Deps) *gin.Engine {
 	videoHandler := video.NewVideoHandler(videoService, accountService)
 	chunkHandler := video.NewChunkUploadHandler(cache)
 	videoGroup := r.Group("/video")
-	videoGroup.Use(jwt.SoftJWTAuth(accountRepository, cache))
 	{
-		videoGroup.POST("/listByAuthorID", videoHandler.ListByAuthorID)
+		videoGroup.POST("/listByAuthorID", jwt.SoftJWTAuth(accountRepository, cache), videoHandler.ListByAuthorID)
 		videoGroup.POST("/getDetail", videoHandler.GetDetail)
 	}
 	protectedVideoGroup := videoGroup.Group("")

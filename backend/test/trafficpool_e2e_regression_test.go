@@ -125,7 +125,7 @@ func (s *inMemoryVideoStore) PublishWithOutbox(ctx context.Context, v *video.Vid
 	return nil
 }
 
-func (s *inMemoryVideoStore) UpdatePoolLevelCAS(ctx context.Context, videoID uint, targetLevel int) (bool, error) {
+func (s *inMemoryVideoStore) UpdatePoolLevelCAS(ctx context.Context, videoID uint, targetLevel video.PoolLevel) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v, ok := s.videos[videoID]
@@ -137,6 +137,7 @@ func (s *inMemoryVideoStore) UpdatePoolLevelCAS(ctx context.Context, videoID uin
 		return false, nil // CAS 失败
 	}
 	v.PoolLevel = targetLevel
+	v.UpdateTime = time.Now()
 	return true, nil
 }
 
@@ -427,7 +428,7 @@ func TestE2E_FullPipelineRegression_ClosedLoop(t *testing.T) {
 				AuthorID:   uint(5000 + i),
 				Title:      fmt.Sprintf("Base Timeline Video %d", i),
 				Status:     video.VideoStatusPublished,
-				PoolLevel:  video.PoolLevelSettled,
+				PoolLevel:  video.PoolLevelSunk,
 				CreateTime: time.Now().Add(-time.Duration(i) * time.Minute),
 			})
 		}
@@ -446,7 +447,7 @@ func TestE2E_FullPipelineRegression_ClosedLoop(t *testing.T) {
 			AuthorID:     authorID,
 			Title:        "违规驳回视频",
 			Status:       video.VideoStatusRejected,
-			PoolLevel:    video.PoolLevelSettled,
+			PoolLevel:    video.PoolLevelSunk,
 			RejectReason: "包含涉政违规词",
 			CreateTime:   time.Now(),
 		}
@@ -704,21 +705,21 @@ func TestE2E_FullPipelineRegression_ClosedLoop(t *testing.T) {
 		mr.ZAdd(candKey, 40.0, strconv.FormatUint(uint64(staleVideo.ID), 10))
 
 		// 24h 兜底判定：曝光 < 50 且无互动，直接沉底淘汰至 Level 0
-		casSuccess, err := videoStore.UpdatePoolLevelCAS(ctx, staleVideo.ID, video.PoolLevelSettled)
+		casSuccess, err := videoStore.UpdatePoolLevelCAS(ctx, staleVideo.ID, video.PoolLevelSunk)
 		if err != nil || !casSuccess {
 			t.Fatalf("deadline fallback CAS update failed: %v", err)
 		}
 		_ = cache.ZRem(ctx, candKey, strconv.FormatUint(uint64(staleVideo.ID), 10))
 
-		// 验证状态变为 Level 0 (已结算/沉底)
+		// 验证状态变为 Level 0 (已沉底)
 		updated, _ := videoStore.GetByID(ctx, staleVideo.ID)
-		if updated.PoolLevel != video.PoolLevelSettled {
-			t.Fatalf("expected pool_level %d (Settled), got: %d", video.PoolLevelSettled, updated.PoolLevel)
+		if updated.PoolLevel != video.PoolLevelSunk {
+			t.Fatalf("expected pool_level %d (Sunk), got: %d", video.PoolLevelSunk, updated.PoolLevel)
 		}
 
 		badge := mapVideoBadge(updated)
-		if badge == nil || badge.Text != "📦 已结算" || badge.ClassName != "badge-settled" {
-			t.Fatalf("unexpected badge for settled video: %+v", badge)
+		if badge == nil || badge.Text != "📦 已沉底" || badge.ClassName != "badge-sunk" {
+			t.Fatalf("unexpected badge for sunk video: %+v", badge)
 		}
 	})
 }
@@ -770,7 +771,7 @@ func TestE2E_DatabaseIndexAndQueryPlan_Audit(t *testing.T) {
 		// 1. CAS 更新 SQL 审计
 		res := dryDB.Model(&video.Video{}).
 			Where("id = ? AND pool_level = 1", 8888).
-			Update("pool_level", video.PoolLevelAdvanced)
+			Updates(map[string]interface{}{"pool_level": video.PoolLevelAdvanced, "update_time": time.Now()})
 		if res.Error != nil {
 			t.Fatalf("CAS query generation failed: %v", res.Error)
 		}
@@ -784,6 +785,9 @@ func TestE2E_DatabaseIndexAndQueryPlan_Audit(t *testing.T) {
 				}
 				if !strings.Contains(q, "pool_level = 1") && !strings.Contains(q, "pool_level` = 1") {
 					t.Errorf("CAS query missing pool_level = 1 condition: %s", q)
+				}
+				if !strings.Contains(q, "update_time") {
+					t.Errorf("CAS query missing update_time column: %s", q)
 				}
 			}
 		}
@@ -926,11 +930,11 @@ func mapVideoBadge(v *video.Video) *badgeInfo {
 	if v.Status == video.VideoStatusPublished {
 		switch v.PoolLevel {
 		case video.PoolLevelSeed:
-			return &badgeInfo{Text: "🌱 种子池扶持中", ClassName: "badge-seed"}
+			return &badgeInfo{Text: fmt.Sprintf("🌱 种子池扶持中 (%d/200)", v.RacingImpressions), ClassName: "badge-seed"}
 		case video.PoolLevelAdvanced:
 			return &badgeInfo{Text: "🔥 进阶爆款", ClassName: "badge-advanced"}
 		default:
-			return &badgeInfo{Text: "📦 已结算", ClassName: "badge-settled"}
+			return &badgeInfo{Text: "📦 已沉底", ClassName: "badge-sunk"}
 		}
 	}
 	return nil
@@ -939,20 +943,21 @@ func mapVideoBadge(v *video.Video) *badgeInfo {
 func TestE2E_FrontendBadgeAndSSEContract(t *testing.T) {
 	t.Run("作品状态机各阶段与前端徽标样式严格映射", func(t *testing.T) {
 		cases := []struct {
-			status    string
-			poolLevel int
-			wantText  string
-			wantClass string
+			status            video.VideoStatus
+			poolLevel         video.PoolLevel
+			racingImpressions int64
+			wantText          string
+			wantClass         string
 		}{
-			{video.VideoStatusAuditing, 0, "🟡 审核中", "badge-auditing"},
-			{video.VideoStatusRejected, 0, "🔴 违规驳回", "badge-rejected"},
-			{video.VideoStatusPublished, video.PoolLevelSeed, "🌱 种子池扶持中", "badge-seed"},
-			{video.VideoStatusPublished, video.PoolLevelAdvanced, "🔥 进阶爆款", "badge-advanced"},
-			{video.VideoStatusPublished, video.PoolLevelSettled, "📦 已结算", "badge-settled"},
+			{video.VideoStatusAuditing, 0, 0, "🟡 审核中", "badge-auditing"},
+			{video.VideoStatusRejected, 0, 0, "🔴 违规驳回", "badge-rejected"},
+			{video.VideoStatusPublished, video.PoolLevelSeed, 45, "🌱 种子池扶持中 (45/200)", "badge-seed"},
+			{video.VideoStatusPublished, video.PoolLevelAdvanced, 0, "🔥 进阶爆款", "badge-advanced"},
+			{video.VideoStatusPublished, video.PoolLevelSunk, 0, "📦 已沉底", "badge-sunk"},
 		}
 
 		for _, tc := range cases {
-			b := mapVideoBadge(&video.Video{Status: tc.status, PoolLevel: tc.poolLevel})
+			b := mapVideoBadge(&video.Video{Status: tc.status, PoolLevel: tc.poolLevel, RacingImpressions: tc.racingImpressions})
 			if b == nil || b.Text != tc.wantText || b.ClassName != tc.wantClass {
 				t.Errorf("badge mismatch for status=%s, pool=%d: got %+v, want text=%s, class=%s",
 					tc.status, tc.poolLevel, b, tc.wantText, tc.wantClass)

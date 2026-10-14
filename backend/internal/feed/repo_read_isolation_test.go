@@ -250,7 +250,7 @@ func TestFeedRepository_ReadIsolation_Integration(t *testing.T) {
 		CoverURL:     "https://cdn.example.com/rej.jpg",
 		Status:       video.VideoStatusRejected,
 		RejectReason: "包含违规内容",
-		PoolLevel:    video.PoolLevelSettled,
+		PoolLevel:    video.PoolLevelSunk,
 		CreateTime:   now.Add(2 * time.Second),
 		Popularity:   200,
 	}

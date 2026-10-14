@@ -38,6 +38,7 @@ export type Video = {
   status?: VideoStatus
   pool_level?: PoolLevel
   reject_reason?: string
+  racing_impressions?: number
 }
 
 export type Comment = {

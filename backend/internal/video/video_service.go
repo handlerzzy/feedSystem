@@ -3,6 +3,7 @@ package video
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/handlerzzy/feedsystem/internal/middleware/rabbitmq"
 	rediscache "github.com/handlerzzy/feedsystem/internal/middleware/redis"
 
+	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
@@ -104,6 +106,15 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
 		return err
 	}
 
+	// 预先将新发布合规视频以 Score=0 推入 Redis 活跃赛马候选队列，杜绝 0 曝光长尾死锁
+	if vs.cache != nil && video.ID > 0 {
+		candidatesKey := vs.cache.Key("feed:racing:candidates")
+		_ = vs.cache.ZAdd(ctx, candidatesKey, goredis.Z{
+			Score:  0,
+			Member: strconv.FormatUint(uint64(video.ID), 10),
+		})
+	}
+
 	// DB 写入**成功之后**才投递 AI 分析任务，best-effort。
 	//
 	// 为什么不走 outbox（本项目最重要的一条约束，改动前务必读
@@ -191,6 +202,20 @@ func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint, viewe
 	}
 	if err != nil {
 		return nil, err
+	}
+	// 为创作者本人填充赛马曝光实时进度 (racing_impressions)
+	if vs.cache != nil && len(videos) > 0 && len(viewerID) > 0 && viewerID[0] == authorID {
+		candidatesKey := vs.cache.Key("feed:racing:candidates")
+		for i := range videos {
+			if videos[i].PoolLevel == PoolLevelSeed {
+				imprKey := vs.cache.Key("feed:video:racing_impressions:%d", videos[i].ID)
+				if val, err := vs.cache.GetInt64(ctx, imprKey); err == nil && val > 0 {
+					videos[i].RacingImpressions = val
+				} else if score, err := vs.cache.ZScore(ctx, candidatesKey, strconv.FormatUint(uint64(videos[i].ID), 10)); err == nil && score > 0 {
+					videos[i].RacingImpressions = int64(score)
+				}
+			}
+		}
 	}
 	return videos, nil
 }

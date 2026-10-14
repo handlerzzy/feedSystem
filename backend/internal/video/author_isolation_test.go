@@ -8,10 +8,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	rediscache "github.com/handlerzzy/feedsystem/internal/middleware/redis"
 	"github.com/handlerzzy/feedsystem/internal/video"
 	"github.com/handlerzzy/feedsystem/internal/video/mock"
 
+	miniredis "github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/mock/gomock"
 )
 
@@ -251,4 +254,50 @@ func TestVideoHandler_ListByAuthorID_HTTPIdentityIsolation(t *testing.T) {
 			t.Fatalf("anonymous visitor should only see published video 2 in HTTP response, got %+v", resp)
 		}
 	})
+}
+
+func TestVideoService_ListByAuthorID_PopulatesRacingImpressions(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("start miniredis failed: %v", err)
+	}
+	defer mr.Close()
+
+	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+	cache := rediscache.NewClient(rdb, "test:")
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	authorID := uint(1001)
+	vSeed := video.Video{
+		ID:        101,
+		AuthorID:  authorID,
+		Title:     "种子视频",
+		Status:    video.VideoStatusPublished,
+		PoolLevel: video.PoolLevelSeed,
+	}
+
+	store := mock.NewMockVideoStore(ctrl)
+	store.EXPECT().
+		ListByAuthorID(gomock.Any(), int64(authorID)).
+		Return([]video.Video{vSeed}, nil)
+
+	// 在 Redis 中设置该视频的赛马有效曝光为 45
+	imprKey := cache.Key("feed:video:racing_impressions:101")
+	mr.Set(imprKey, "45")
+
+	svc := video.NewVideoService(store, cache, nil)
+
+	videos, err := svc.ListByAuthorID(context.Background(), authorID, authorID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(videos) != 1 {
+		t.Fatalf("expected 1 video, got %d", len(videos))
+	}
+	if videos[0].RacingImpressions != 45 {
+		t.Fatalf("expected racing_impressions 45, got %d", videos[0].RacingImpressions)
+	}
 }
