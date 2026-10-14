@@ -117,6 +117,82 @@ func TestVideoServicePublish(t *testing.T) {
 			t.Fatalf("expected original error, got %v", err)
 		}
 	})
+
+	t.Run("标题或描述命中敏感词时返回 ErrContentViolation(400) 且不落库", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			video *video.Video
+		}{
+			{
+				name: "标题命中敏感词",
+				video: &video.Video{
+					Title:    "精彩的赌博实况直播",
+					PlayURL:  "https://cdn.example.com/play.mp4",
+					CoverURL: "https://cdn.example.com/cover.jpg",
+				},
+			},
+			{
+				name: "描述命中敏感词",
+				video: &video.Video{
+					Title:       "正常合规标题",
+					Description: "点击链接加入色情群聊",
+					PlayURL:     "https://cdn.example.com/play.mp4",
+					CoverURL:    "https://cdn.example.com/cover.jpg",
+				},
+			},
+			{
+				name: "特殊字符混淆敏感词",
+				video: &video.Video{
+					Title:    "最新 bad*word 教学",
+					PlayURL:  "https://cdn.example.com/play.mp4",
+					CoverURL: "https://cdn.example.com/cover.jpg",
+				},
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newVideoFixture(t)
+				// 未设置 PublishWithOutbox 期望 => 机审违规绝不能落库
+
+				err := f.svc.Publish(context.Background(), tc.video)
+				if !errors.Is(err, apierror.ErrContentViolation) {
+					t.Fatalf("expected apierror.ErrContentViolation, got %v", err)
+				}
+				if got := apierror.ClassifyHTTPStatus(err); got != 400 {
+					t.Errorf("HTTP status = %d, want 400", got)
+				}
+				if got := apierror.PublicMessage(err); got != "content contains sensitive words" {
+					t.Errorf("public message = %q, want 'content contains sensitive words'", got)
+				}
+			})
+		}
+	})
+
+	t.Run("合规发布赋予 status=published 且 pool_level=1 初始态", func(t *testing.T) {
+		f := newVideoFixture(t)
+		v := validVideo()
+		f.store.EXPECT().PublishWithOutbox(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, got *video.Video) error {
+				if got.Status != video.VideoStatusPublished {
+					t.Errorf("Status = %q, want %q", got.Status, video.VideoStatusPublished)
+				}
+				if got.PoolLevel != video.PoolLevelSeed {
+					t.Errorf("PoolLevel = %d, want %d", got.PoolLevel, video.PoolLevelSeed)
+				}
+				return nil
+			})
+
+		if err := f.svc.Publish(context.Background(), v); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if v.Status != video.VideoStatusPublished {
+			t.Errorf("video.Status = %q, want %q", v.Status, video.VideoStatusPublished)
+		}
+		if v.PoolLevel != video.PoolLevelSeed {
+			t.Errorf("video.PoolLevel = %d, want %d", v.PoolLevel, video.PoolLevelSeed)
+		}
+	})
 }
 
 // ---------- Delete ----------

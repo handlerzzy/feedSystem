@@ -173,6 +173,19 @@ func TestServiceLayerErrorContract(t *testing.T) {
 				return f.svc.Unlike(context.Background(), &video.Like{VideoID: 0, AccountID: fixtureAccountID})
 			},
 		},
+		{
+			name:        "VideoService.Publish: 标题命中违规敏感词",
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "content contains sensitive words",
+			run: func(t *testing.T) error {
+				f := newVideoFixture(t)
+				return f.svc.Publish(context.Background(), &video.Video{
+					Title:    "精彩色情直播",
+					PlayURL:  "https://example.com/play.mp4",
+					CoverURL: "https://example.com/cover.jpg",
+				})
+			},
+		},
 	}
 
 	for _, tc := range cases {

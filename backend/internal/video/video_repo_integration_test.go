@@ -148,8 +148,8 @@ func TestPublishWithOutboxIntegration(t *testing.T) {
 	if msg.Status != "pending" {
 		t.Errorf("outbox.status = %q, want %q（worker 只抢占 pending，其它值等于永不投递）", msg.Status, "pending")
 	}
-	if msg.EventType != "video_published" {
-		t.Errorf("outbox.event_type = %q, want %q", msg.EventType, "video_published")
+	if msg.EventType != video.OutboxEventTimeline {
+		t.Errorf("outbox.event_type = %q, want %q", msg.EventType, video.OutboxEventTimeline)
 	}
 	if msg.CreateTime.IsZero() {
 		t.Error("outbox.create_time 为零值；worker 按 create_time ASC 排序，零值会让该行永远排在最前")

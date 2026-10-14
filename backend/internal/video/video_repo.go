@@ -30,7 +30,7 @@ func (vr *VideoRepository) PublishWithOutbox(ctx context.Context, video *Video) 
 
 		msg := OutboxMsg{
 			VideoID:    video.ID,
-			EventType:  "video_published",
+			EventType:  OutboxEventTimeline,
 			Status:     "pending",
 			CreateTime: video.CreateTime,
 		}

@@ -45,6 +45,9 @@ func openIntegrationDB(t *testing.T) *gorm.DB {
 	if err := sqlDB.Ping(); err != nil {
 		t.Fatalf("数据库不可达: %v", err)
 	}
+	if err := db.AutoMigrate(&video.Video{}, &video.OutboxMsg{}); err != nil {
+		t.Fatalf("AutoMigrate 失败: %v", err)
+	}
 	return db
 }
 

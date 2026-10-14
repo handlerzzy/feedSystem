@@ -100,8 +100,9 @@ func StartOutboxPoller(ctx context.Context, db *gorm.DB, tmq *rabbitmq.TimelineM
 	}
 }
 
-// claim 在一个事务内抢占至多 limit 条 pending 消息，并置为 processing。
+// claim 在一个事务内抢占至多 limit 条 pending 且属于 timeline 的消息，并置为 processing。
 // SKIP LOCKED 让并发副本跳过已被别人锁定的行，而不是阻塞等待。
+// 严格按 event_type = 'timeline' 进行过滤，防止抢跑或误删其他业务事件。
 func (p *outboxPoller) claim(ctx context.Context, limit int) ([]video.OutboxMsg, error) {
 	var claimed []video.OutboxMsg
 	err := p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -109,7 +110,8 @@ func (p *outboxPoller) claim(ctx context.Context, limit int) ([]video.OutboxMsg,
 		if err := tx.Clauses(clause.Locking{
 			Strength: clause.LockingStrengthUpdate,
 			Options:  clause.LockingOptionsSkipLocked,
-		}).Where("status = ?", outboxStatusPending).Order("create_time ASC").Limit(limit).
+		}).Where("status = ? AND event_type = ?", outboxStatusPending, video.OutboxEventTimeline).
+			Order("create_time ASC").Limit(limit).
 			Find(&batch).Error; err != nil {
 			return err
 		}
@@ -130,6 +132,9 @@ func (p *outboxPoller) claim(ctx context.Context, limit int) ([]video.OutboxMsg,
 
 // deliver 投递单条消息：成功即删除并返回 true；失败必须回置 pending，否则会永久卡在 processing。
 func (p *outboxPoller) deliver(ctx context.Context, msg *video.OutboxMsg) bool {
+	if msg == nil || msg.EventType != video.OutboxEventTimeline {
+		return false
+	}
 	if err := p.mq.PublishVideo(ctx, msg.VideoID, msg.CreateTime); err != nil {
 		// 投递失败但消息会回置 pending 等待下一轮重投，不丢消息，故为 Warn。
 		logging.Ctx(ctx).Warn("投递 MQ 失败",
@@ -152,10 +157,10 @@ func (p *outboxPoller) deliver(ctx context.Context, msg *video.OutboxMsg) bool {
 	return true
 }
 
-// requeueZombies 回收长时间停留在 processing 的消息（抢占者崩溃/被 kill 的场景）。
+// requeueZombies 回收长时间停留在 processing 的 timeline 消息（抢占者崩溃/被 kill 的场景）。
 func (p *outboxPoller) requeueZombies(ctx context.Context) {
 	res := p.db.WithContext(ctx).Model(&video.OutboxMsg{}).
-		Where("status = ? AND create_time < ?", outboxStatusProcessing, time.Now().Add(-outboxZombieAfter)).
+		Where("status = ? AND event_type = ? AND create_time < ?", outboxStatusProcessing, video.OutboxEventTimeline, time.Now().Add(-outboxZombieAfter)).
 		Update("status", outboxStatusPending)
 	if res.Error != nil {
 		// 纯维护动作，30 轮后才再试，不影响主流程，故为 Warn。

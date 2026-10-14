@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/handlerzzy/feedsystem/internal/apierror"
+	"github.com/handlerzzy/feedsystem/internal/audit"
 	"github.com/handlerzzy/feedsystem/internal/logging"
 	"github.com/handlerzzy/feedsystem/internal/middleware/rabbitmq"
 	rediscache "github.com/handlerzzy/feedsystem/internal/middleware/redis"
@@ -24,10 +25,24 @@ type VideoService struct {
 	analysisMQ ContentAnalysisPublisher
 	// embeddingTrigger 是 P2 视频发布后即时触发单条向量计算的能力，为 nil 表示不触发。
 	embeddingTrigger EmbeddingTrigger
+	// auditor 是 L1 同步轻机审敏感词审计器，默认使用内建前缀树。
+	auditor audit.ContentAuditor
 }
 
 func NewVideoService(repo VideoStore, cache *rediscache.Client, popularityMQ PopularityPublisher) *VideoService {
-	return &VideoService{repo: repo, cache: cache, cacheTTL: 5 * time.Minute, popularityMQ: popularityMQ}
+	return &VideoService{
+		repo:         repo,
+		cache:        cache,
+		cacheTTL:     5 * time.Minute,
+		popularityMQ: popularityMQ,
+		auditor:      audit.NewDefaultTrieAuditor(),
+	}
+}
+
+// WithAuditor 注入自定义机审审计器，返回自身以支持链式装配与单测注入。
+func (vs *VideoService) WithAuditor(a audit.ContentAuditor) *VideoService {
+	vs.auditor = a
+	return vs
 }
 
 // WithContentAnalysis 注入 AI 分析投递器，返回自身以支持链式装配。
@@ -63,6 +78,24 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
 	if video.CoverURL == "" {
 		return apierror.ErrValidation
 	}
+
+	// L1 内存同步轻机审阻断：基于内存前缀树检测标题与描述文本（单次耗时 <0.2ms）
+	if vs.auditor != nil {
+		contentToAudit := video.Title
+		if strings.TrimSpace(video.Description) != "" {
+			contentToAudit += " " + video.Description
+		}
+		if pass, hitWord := vs.auditor.AuditText(contentToAudit); !pass {
+			logging.Ctx(ctx).Warn("视频机审阻断：包含违规敏感词",
+				zap.Uint("author_id", video.AuthorID),
+				zap.String("hit_word", hitWord))
+			return apierror.ErrContentViolation
+		}
+	}
+
+	// 合规视频赋予初始状态：status = published, pool_level = 1 (种子扶持池)
+	video.Status = VideoStatusPublished
+	video.PoolLevel = PoolLevelSeed
 
 	// 事务保证视频写入库和消息写入本地消息表的一致性。
 	// 事务已下沉到 repo（见 VideoRepository.PublishWithOutbox）：

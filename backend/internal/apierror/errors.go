@@ -16,6 +16,7 @@ var (
 	ErrForbidden    = errors.New("forbidden") // 新增：归属校验失败用 403
 	ErrNotFound     = errors.New("not found") // 新增：明确的资源不存在
 	ErrConflict     = errors.New("conflict")  // 新增：唯一键冲突等
+	ErrContentViolation = errors.New("content contains sensitive words") // 机审敏感词阻断
 )
 
 func ClassifyHTTPStatus(err error) int {
@@ -46,7 +47,7 @@ func ClassifyHTTPStatus(err error) int {
 		return http.StatusUnauthorized
 	case errors.Is(err, ErrForbidden):
 		return http.StatusForbidden
-	case errors.Is(err, ErrValidation):
+	case errors.Is(err, ErrValidation), errors.Is(err, ErrContentViolation):
 		return http.StatusBadRequest
 	case errors.Is(err, ErrConflict):
 		return http.StatusConflict
