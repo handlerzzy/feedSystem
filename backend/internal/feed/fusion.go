@@ -3,6 +3,7 @@ package feed
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/handlerzzy/feedsystem/internal/logging"
@@ -220,6 +221,26 @@ func (f *FeedService) exploreRecall(ctx context.Context, viewerAccountID uint, q
 			zap.Duration("freshness", ExploreFreshness), zap.Error(err))
 		return nil
 	}
+
+	// 1. 严格过滤未审核与驳回的违规内容，公域探索槽位仅保留已发布视频
+	published := make([]*video.Video, 0, len(fresh))
+	for _, v := range fresh {
+		if v != nil && v.Status == video.VideoStatusPublished {
+			published = append(published, v)
+		}
+	}
+	fresh = published
+
+	// 2. 优先提取 pool_level = 1 种子视频注入探索槽位，精准赋能冷启动试水曝光
+	sort.SliceStable(fresh, func(i, j int) bool {
+		iSeed := fresh[i].PoolLevel == video.PoolLevelSeed
+		jSeed := fresh[j].PoolLevel == video.PoolLevelSeed
+		if iSeed != jSeed {
+			return iSeed
+		}
+		return false
+	})
+
 	if f.localcache != nil {
 		f.localcache.Set(key, fresh, 2*time.Second)
 	}

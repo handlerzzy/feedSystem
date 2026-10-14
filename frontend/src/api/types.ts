@@ -22,6 +22,9 @@ export type Account = {
   bio?: string
 }
 
+export type VideoStatus = 'auditing' | 'published' | 'rejected'
+export type PoolLevel = 0 | 1 | 2
+
 export type Video = {
   id: number
   author_id: number
@@ -32,6 +35,9 @@ export type Video = {
   cover_url: string
   create_time: string
   likes_count: number
+  status?: VideoStatus
+  pool_level?: PoolLevel
+  reject_reason?: string
 }
 
 export type Comment = {

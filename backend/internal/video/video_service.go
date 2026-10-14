@@ -177,8 +177,18 @@ func (vs *VideoService) Delete(ctx context.Context, id uint, authorID uint) erro
 	return nil
 }
 
-func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint) ([]Video, error) {
-	videos, err := vs.repo.ListByAuthorID(ctx, int64(authorID))
+func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint, viewerID ...uint) ([]Video, error) {
+	var (
+		videos []Video
+		err    error
+	)
+	if len(viewerID) > 0 && viewerID[0] > 0 && viewerID[0] == authorID {
+		// 仅当明确且有效验证为作者本人（viewerID == authorID 且 > 0）时，可见自身全部生命周期状态的作品
+		videos, err = vs.repo.ListByAuthorID(ctx, int64(authorID))
+	} else {
+		// 其余一切情况（外部访客、未登录游客、或未明确指定身份请求）严格收敛只读 published 作品
+		videos, err = vs.repo.ListPublishedByAuthorID(ctx, int64(authorID))
+	}
 	if err != nil {
 		return nil, err
 	}

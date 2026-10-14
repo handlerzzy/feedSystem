@@ -310,7 +310,7 @@ func TestVideoServiceListByAuthorID(t *testing.T) {
 		want := []video.Video{{ID: 1, AuthorID: fixtureAccountID}}
 		f.store.EXPECT().ListByAuthorID(gomock.Any(), int64(fixtureAccountID)).Return(want, nil)
 
-		got, err := f.svc.ListByAuthorID(context.Background(), fixtureAccountID)
+		got, err := f.svc.ListByAuthorID(context.Background(), fixtureAccountID, fixtureAccountID)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -324,7 +324,7 @@ func TestVideoServiceListByAuthorID(t *testing.T) {
 		dbErr := errors.New("db down")
 		f.store.EXPECT().ListByAuthorID(gomock.Any(), int64(fixtureAccountID)).Return(nil, dbErr)
 
-		if _, err := f.svc.ListByAuthorID(context.Background(), fixtureAccountID); !errors.Is(err, dbErr) {
+		if _, err := f.svc.ListByAuthorID(context.Background(), fixtureAccountID, fixtureAccountID); !errors.Is(err, dbErr) {
 			t.Fatalf("expected original error, got %v", err)
 		}
 	})

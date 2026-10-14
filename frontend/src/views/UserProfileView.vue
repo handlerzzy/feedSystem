@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import AppShell from '../components/AppShell.vue'
 import UserAvatar from '../components/UserAvatar.vue'
-import { ApiError } from '../api/client'
+import { API_BASE, ApiError } from '../api/client'
 import * as accountApi from '../api/account'
 import * as socialApi from '../api/social'
 import type { Account, Video } from '../api/types'
@@ -147,22 +147,99 @@ async function goVideo(videoId: number) {
   await router.push(`/video/${videoId}`)
 }
 
+function getVideoBadge(v: Video): { text: string; className: string } | null {
+  if (!isMe.value) return null
+
+  if (v.status === 'rejected') {
+    return { text: '🔴 违规驳回', className: 'badge-rejected' }
+  }
+  if (v.status === 'auditing') {
+    return { text: '🟡 审核中', className: 'badge-auditing' }
+  }
+  if (v.status === 'published') {
+    if (v.pool_level === 1) {
+      return { text: '🌱 种子池扶持中', className: 'badge-seed' }
+    }
+    if (v.pool_level === 2) {
+      return { text: '🔥 进阶爆款', className: 'badge-advanced' }
+    }
+    return { text: '📦 已结算', className: 'badge-settled' }
+  }
+  return null
+}
+
+let eventSource: EventSource | null = null
+
+function setupSSE() {
+  if (eventSource) {
+    eventSource.close()
+    eventSource = null
+  }
+  if (!isMe.value || !auth.token) {
+    return
+  }
+  try {
+    const sseUrl = `${API_BASE}/notification/stream?token=${encodeURIComponent(auth.token)}`
+    const es = new EventSource(sseUrl)
+    es.onmessage = (event) => {
+      try {
+        const notif = JSON.parse(event.data)
+        if (notif && notif.type === 'promotion') {
+          const vid = Number(notif.target_id)
+          const targetVideo = state.videos.find((v) => v.id === vid)
+          if (targetVideo) {
+            targetVideo.pool_level = 2
+            targetVideo.status = 'published'
+            toast.success(`🎉 喜报：作品《${targetVideo.title}》已成功晋升进阶推荐池！`)
+          } else {
+            loadProfile()
+          }
+        }
+      } catch {
+        // 忽略非 JSON 心跳或注释
+      }
+    }
+    es.onerror = () => {
+      // EventSource 会按标准自动重连
+    }
+    eventSource = es
+  } catch (e) {
+    console.error('SSE connection error', e)
+  }
+}
+
+function closeSSE() {
+  if (eventSource) {
+    eventSource.close()
+    eventSource = null
+  }
+}
+
 watch(
   () => route.params.id,
   async () => {
     drawer.open = false
     await loadProfile()
+    setupSSE()
   },
 )
 
 watch(
-  () => auth.isLoggedIn,
+  () => [auth.isLoggedIn, isMe.value],
   async () => {
     await loadSocialCounts()
+    setupSSE()
   },
 )
 
-onMounted(loadProfile)
+onMounted(async () => {
+  await loadProfile()
+  setupSSE()
+})
+
+onUnmounted(() => {
+  closeSSE()
+})
 </script>
 
 <template>
@@ -219,10 +296,22 @@ onMounted(loadProfile)
 
       <div v-else class="video-grid" style="margin-top: 12px">
         <button v-for="v in state.videos" :key="v.id" class="video-card" type="button" @click="goVideo(v.id)">
-          <img class="video-cover" :src="v.cover_url" :alt="v.title" loading="lazy" />
+          <div class="video-cover-container">
+            <img class="video-cover" :src="v.cover_url" :alt="v.title" loading="lazy" />
+            <span
+              v-if="getVideoBadge(v)"
+              :class="['status-badge', getVideoBadge(v)!.className]"
+              :title="v.reject_reason || getVideoBadge(v)!.text"
+            >
+              {{ getVideoBadge(v)!.text }}
+            </span>
+          </div>
           <div class="video-meta">
             <div class="video-title">{{ v.title }}</div>
             <div class="video-sub subtle">❤️ {{ v.likes_count }} · {{ new Date(v.create_time).toLocaleDateString() }}</div>
+            <div v-if="isMe && v.status === 'rejected' && v.reject_reason" class="reject-hint" :title="v.reject_reason">
+              驳回原因：{{ v.reject_reason }}
+            </div>
           </div>
         </button>
       </div>
@@ -342,12 +431,72 @@ onMounted(loadProfile)
   background: rgba(255, 255, 255, 0.08);
 }
 
-.video-cover {
+.video-cover-container {
+  position: relative;
   width: 100%;
   aspect-ratio: 9/12;
+  background: rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.video-cover {
+  width: 100%;
+  height: 100%;
   object-fit: cover;
   display: block;
-  background: rgba(0, 0, 0, 0.35);
+}
+
+.status-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  z-index: 2;
+  letter-spacing: 0.2px;
+}
+
+.badge-seed {
+  background: rgba(34, 197, 94, 0.85);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.badge-advanced {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.9), rgba(249, 115, 22, 0.9));
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  box-shadow: 0 0 10px rgba(249, 115, 22, 0.5);
+}
+
+.badge-settled {
+  background: rgba(100, 116, 139, 0.85);
+  color: #f1f5f9;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.badge-rejected {
+  background: rgba(220, 38, 38, 0.9);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.badge-auditing {
+  background: rgba(234, 179, 8, 0.9);
+  color: #1e293b;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+.reject-hint {
+  font-size: 11px;
+  color: var(--danger, #ef4444);
+  margin-top: 4px;
+  line-height: 1.3;
 }
 
 .video-meta {

@@ -1,4 +1,4 @@
-import type { Account, Comment, FeedAuthor, FeedVideoItem, Video } from './types'
+import type { Account, Comment, FeedAuthor, FeedVideoItem, PoolLevel, Video, VideoStatus } from './types'
 
 export function listOrEmpty<T>(value: T[] | null | undefined): T[] {
   return Array.isArray(value) ? value : []
@@ -45,6 +45,9 @@ export function normalizeVideoList(value: Video[] | null | undefined): Video[] {
     play_url: video.play_url || '',
     cover_url: video.cover_url || '',
     likes_count: Number(video.likes_count ?? 0),
+    status: (video.status || 'published') as VideoStatus,
+    pool_level: (Number(video.pool_level ?? 0) as PoolLevel),
+    reject_reason: video.reject_reason || '',
   }))
 }
 

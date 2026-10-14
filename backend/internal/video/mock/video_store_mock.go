@@ -11,9 +11,9 @@ package mock
 
 import (
 	context "context"
-	video "github.com/handlerzzy/feedsystem/internal/video"
 	reflect "reflect"
 
+	video "github.com/handlerzzy/feedsystem/internal/video"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -83,6 +83,21 @@ func (m *MockVideoStore) ListByAuthorID(ctx context.Context, authorID int64) ([]
 func (mr *MockVideoStoreMockRecorder) ListByAuthorID(ctx, authorID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListByAuthorID", reflect.TypeOf((*MockVideoStore)(nil).ListByAuthorID), ctx, authorID)
+}
+
+// ListPublishedByAuthorID mocks base method.
+func (m *MockVideoStore) ListPublishedByAuthorID(ctx context.Context, authorID int64) ([]video.Video, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListPublishedByAuthorID", ctx, authorID)
+	ret0, _ := ret[0].([]video.Video)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListPublishedByAuthorID indicates an expected call of ListPublishedByAuthorID.
+func (mr *MockVideoStoreMockRecorder) ListPublishedByAuthorID(ctx, authorID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListPublishedByAuthorID", reflect.TypeOf((*MockVideoStore)(nil).ListPublishedByAuthorID), ctx, authorID)
 }
 
 // PublishWithOutbox mocks base method.

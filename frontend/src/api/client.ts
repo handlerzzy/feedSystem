@@ -15,7 +15,7 @@ export class ApiError extends Error {
 
 type ApiErrorBody = { error?: string }
 
-const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api'
+export const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api'
 
 let isRefreshing = false
 let refreshPromise: Promise<string | null> | null = null

@@ -11,9 +11,9 @@ package mock
 
 import (
 	context "context"
-	rabbitmq "github.com/handlerzzy/feedsystem/internal/middleware/rabbitmq"
 	reflect "reflect"
 
+	rabbitmq "github.com/handlerzzy/feedsystem/internal/middleware/rabbitmq"
 	gomock "go.uber.org/mock/gomock"
 )
 

@@ -197,7 +197,11 @@ func (vh *VideoHandler) ListByAuthorID(c *gin.Context) {
 		apierror.Respond(c, err)
 		return
 	}
-	videos, err := vh.service.ListByAuthorID(c.Request.Context(), req.AuthorID)
+	viewerID, err := jwt.GetAccountID(c)
+	if err != nil {
+		viewerID = 0
+	}
+	videos, err := vh.service.ListByAuthorID(c.Request.Context(), req.AuthorID, viewerID)
 	if err != nil {
 		apierror.Respond(c, err)
 		return

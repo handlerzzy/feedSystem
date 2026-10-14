@@ -151,6 +151,18 @@ func (vr *VideoRepository) ListByAuthorID(ctx context.Context, authorID int64) (
 	return videos, nil
 }
 
+func (vr *VideoRepository) ListPublishedByAuthorID(ctx context.Context, authorID int64) ([]Video, error) {
+	var videos []Video
+	if err := vr.db.WithContext(ctx).
+		Where("author_id = ? AND status = ?", authorID, VideoStatusPublished).
+		Order("create_time desc").
+		Limit(200).
+		Find(&videos).Error; err != nil {
+		return nil, err
+	}
+	return videos, nil
+}
+
 func (vr *VideoRepository) GetByID(ctx context.Context, id uint) (*Video, error) {
 	var video Video
 	if err := vr.db.WithContext(ctx).First(&video, id).Error; err != nil {

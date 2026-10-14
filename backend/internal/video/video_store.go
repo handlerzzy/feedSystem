@@ -33,6 +33,7 @@ type VideoStore interface {
 	GetByID(ctx context.Context, id uint) (*Video, error)
 	DeleteVideo(ctx context.Context, id uint) error
 	ListByAuthorID(ctx context.Context, authorID int64) ([]Video, error)
+	ListPublishedByAuthorID(ctx context.Context, authorID int64) ([]Video, error)
 	PublishWithOutbox(ctx context.Context, video *Video) error
 }
 

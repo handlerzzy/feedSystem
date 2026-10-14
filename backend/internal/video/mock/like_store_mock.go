@@ -11,9 +11,9 @@ package mock
 
 import (
 	context "context"
-	video "github.com/handlerzzy/feedsystem/internal/video"
 	reflect "reflect"
 
+	video "github.com/handlerzzy/feedsystem/internal/video"
 	gomock "go.uber.org/mock/gomock"
 )
 

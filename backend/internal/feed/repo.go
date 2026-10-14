@@ -20,6 +20,7 @@ func NewFeedRepository(db *gorm.DB) *FeedRepository {
 func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBefore time.Time) ([]*video.Video, error) {
 	var videos []*video.Video
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+		Where("status = ?", video.VideoStatusPublished).
 		Order("create_time DESC")
 	if !latestBefore.IsZero() {
 		query = query.Where("create_time < ?", latestBefore)
@@ -33,6 +34,7 @@ func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBef
 func (repo *FeedRepository) ListLikesCountWithCursor(ctx context.Context, limit int, cursor *LikesCountCursor) ([]*video.Video, error) {
 	var videos []*video.Video
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+		Where("status = ?", video.VideoStatusPublished).
 		Order("likes_count DESC, id DESC")
 
 	if cursor != nil {
@@ -52,6 +54,7 @@ func (repo *FeedRepository) ListLikesCountWithCursor(ctx context.Context, limit 
 func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, viewerAccountID uint, latestBefore time.Time) ([]*video.Video, error) {
 	var videos []*video.Video
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+		Where("status = ?", video.VideoStatusPublished).
 		Order("create_time DESC")
 	if viewerAccountID > 0 {
 		followingSubQuery := repo.db.WithContext(ctx).
@@ -72,6 +75,7 @@ func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, view
 func (repo *FeedRepository) ListByPopularity(ctx context.Context, limit int, popularityBefore int64, timeBefore time.Time, idBefore uint) ([]*video.Video, error) {
 	var videos []*video.Video
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+		Where("status = ?", video.VideoStatusPublished).
 		Order("popularity DESC, create_time DESC, id DESC")
 
 	// 只有当游标完整提供时才加过滤（popularity 允许为 0）
@@ -107,7 +111,7 @@ func (repo *FeedRepository) ListByTag(ctx context.Context, tagName string, limit
 	err := repo.db.WithContext(ctx).Model(&video.Video{}).Table("videos").
 		Joins("JOIN video_tags ON video_tags.video_id = videos.id").
 		Joins("JOIN tags ON tags.id = video_tags.tag_id").
-		Where("tags.name = ?", tagName).
+		Where("tags.name = ? AND videos.status = ?", tagName, video.VideoStatusPublished).
 		Order("videos.create_time desc").
 		Limit(limit).
 		Find(&videos).Error
@@ -121,7 +125,7 @@ func (repo *FeedRepository) ListLongTailByTag(ctx context.Context, tagName strin
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).Table("videos").
 		Joins("JOIN video_tags ON video_tags.video_id = videos.id").
 		Joins("JOIN tags ON tags.id = video_tags.tag_id").
-		Where("tags.name = ?", tagName)
+		Where("tags.name = ? AND videos.status = ?", tagName, video.VideoStatusPublished)
 	if len(excludeIDs) > 0 {
 		query = query.Where("videos.id NOT IN ?", excludeIDs)
 	}
@@ -158,9 +162,10 @@ func (repo *FeedRepository) ListFreshLowEngagement(ctx context.Context, limit in
 	}
 	since := time.Now().Add(-freshness)
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+		Where("status = ?", video.VideoStatusPublished).
 		Where("create_time >= ?", since).
 		Where("popularity < ?", maxPopularity).
-		Order("create_time DESC, id DESC")
+		Order("(CASE WHEN pool_level = 1 THEN 0 ELSE 1 END), create_time DESC, id DESC")
 	if excludeAuthorID > 0 {
 		query = query.Where("author_id <> ?", excludeAuthorID)
 	}
