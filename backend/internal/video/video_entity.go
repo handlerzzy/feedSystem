@@ -48,7 +48,8 @@ type GetDetailRequest struct {
 type OutboxMsg struct {
 	ID         uint      `gorm:"primaryKey"`
 	VideoID    uint      `gorm:"index"`
-	EventType  string    `gorm:"type:varchar(50)"`
-	CreateTime time.Time `gorm:"autoCreateTime"`
-	Status     string    `gorm:"type:varchar(50);index"`
+	EventType  string    `gorm:"type:varchar(50);index:idx_outbox_msgs_status_type_time,priority:2"`
+	CreateTime time.Time `gorm:"autoCreateTime;index:idx_outbox_msgs_status_type_time,priority:3,sort:asc"`
+	Status     string    `gorm:"type:varchar(50);index:idx_outbox_msgs_status_type_time,priority:1"`
 }
+
