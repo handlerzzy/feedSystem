@@ -203,16 +203,33 @@ func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint, viewe
 	if err != nil {
 		return nil, err
 	}
-	// 为创作者本人填充赛马曝光实时进度 (racing_impressions)
+	// 为创作者本人批量填充赛马曝光实时进度 (racing_impressions)，单次网络往返 (SLA 性能预算：杜绝 N+1 外部阻塞)
 	if vs.cache != nil && len(videos) > 0 && len(viewerID) > 0 && viewerID[0] == authorID {
-		candidatesKey := vs.cache.Key("feed:racing:candidates")
+		var seedIndices []int
+		var keys []string
 		for i := range videos {
 			if videos[i].PoolLevel == PoolLevelSeed {
-				imprKey := vs.cache.Key("feed:video:racing_impressions:%d", videos[i].ID)
-				if val, err := vs.cache.GetInt64(ctx, imprKey); err == nil && val > 0 {
-					videos[i].RacingImpressions = val
-				} else if score, err := vs.cache.ZScore(ctx, candidatesKey, strconv.FormatUint(uint64(videos[i].ID), 10)); err == nil && score > 0 {
-					videos[i].RacingImpressions = int64(score)
+				seedIndices = append(seedIndices, i)
+				keys = append(keys, vs.cache.Key("feed:video:racing_impressions:%d", videos[i].ID))
+			}
+		}
+		if len(keys) > 0 {
+			if vals, err := vs.cache.MGet(ctx, keys...); err == nil && len(vals) == len(keys) {
+				for k, idx := range seedIndices {
+					if vals[k] != nil {
+						switch v := vals[k].(type) {
+						case string:
+							if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+								videos[idx].RacingImpressions = n
+							}
+						case []byte:
+							if n, err := strconv.ParseInt(string(v), 10, 64); err == nil && n > 0 {
+								videos[idx].RacingImpressions = n
+							}
+						case int64:
+							videos[idx].RacingImpressions = v
+						}
+					}
 				}
 			}
 		}

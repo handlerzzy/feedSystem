@@ -97,6 +97,7 @@ type TrafficPoolWorker struct {
 	promotionScoreThreshold float64
 	sinkScoreThreshold      float64
 	nowFunc                 func() time.Time
+	sweepCursor             uint
 }
 
 // NewTrafficPoolWorker 创建并初始化赛马调度引擎实例。
@@ -304,16 +305,21 @@ func (w *TrafficPoolWorker) SettleBatch(ctx context.Context) (int, error) {
 		}
 	}
 
-	// 3. 兜底巡检：查询创建时间超过 24 小时但仍停留在种子池中的视频，彻底防止 0 曝光长尾死锁
+	// 3. 游标巡检 (Cursor Backfill)：基于主键递增分批向前推进兜底 24h 到期种子视频 (WHERE id > ? ORDER BY id ASC)
 	deadlineTime := w.now().Add(-w.deadlineDuration)
 	var expiredDBIDs []uint
-	if err := w.db.WithContext(ctx).Model(&video.Video{}).
-		Where("pool_level = ? AND create_time <= ?", video.PoolLevelSeed, deadlineTime).
-		Limit(int(limit)).
-		Pluck("id", &expiredDBIDs).Error; err == nil {
+	query := w.db.WithContext(ctx).Model(&video.Video{}).
+		Where("id > ? AND pool_level = ? AND create_time <= ?", w.sweepCursor, video.PoolLevelSeed, deadlineTime).
+		Order("id ASC").
+		Limit(int(limit))
+	if err := query.Pluck("id", &expiredDBIDs).Error; err == nil && len(expiredDBIDs) > 0 {
+		w.sweepCursor = expiredDBIDs[len(expiredDBIDs)-1]
 		for _, id := range expiredDBIDs {
 			eligibleSet[id] = struct{}{}
 		}
+	} else {
+		// 游标推进至末尾或批次为空，重置游标开启下一轮巡检
+		w.sweepCursor = 0
 	}
 
 	if len(eligibleSet) == 0 {
@@ -322,7 +328,18 @@ func (w *TrafficPoolWorker) SettleBatch(ctx context.Context) (int, error) {
 
 	eligibleIDs := make([]uint, 0, len(eligibleSet))
 	for id := range eligibleSet {
+		// 过滤短期观察冷却中的视频，防止 5 秒高频空转重复查 DB 算分
+		if w.cache != nil {
+			evalKey := w.cache.Key("feed:racing:obs_cooldown:%d", id)
+			if exists, err := w.cache.Exists(ctx, evalKey); err == nil && exists {
+				continue
+			}
+		}
 		eligibleIDs = append(eligibleIDs, id)
+	}
+
+	if len(eligibleIDs) == 0 {
+		return 0, nil
 	}
 
 	results, err := w.SettleCandidates(ctx, eligibleIDs)
@@ -460,6 +477,11 @@ func (w *TrafficPoolWorker) SettleCandidates(ctx context.Context, videoIDs []uin
 
 		// 仍在观察期，不执行状态跃迁，保留在候选池与种子池中
 		if targetLevel == -1 {
+			// 设置 1 分钟观察冷却标记，避免 Worker 每 5 秒重复查 DB 算分产生高频空转
+			if w.cache != nil {
+				evalKey := w.cache.Key("feed:racing:obs_cooldown:%d", v.ID)
+				_ = w.cache.SetBytes(ctx, evalKey, []byte("1"), 1*time.Minute)
+			}
 			results = append(results, SettlementResult{
 				VideoID:         v.ID,
 				AuthorID:        v.AuthorID,
