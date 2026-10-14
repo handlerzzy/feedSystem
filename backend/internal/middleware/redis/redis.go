@@ -136,3 +136,20 @@ func (c *Client) IncrementWithExpire(ctx context.Context, key string, expire tim
 		expire.Milliseconds(),
 	).Int64()
 }
+
+// RDB 返回底层的 *redis.Client，支持高级操作（如 Pipeline、Lua 脚本执行）。
+func (c *Client) RDB() *redis.Client {
+	if c == nil {
+		return nil
+	}
+	return c.rdb
+}
+
+// Pipeline 返回一个新的 redis.Pipeliner。
+func (c *Client) Pipeline() redis.Pipeliner {
+	if c == nil || c.rdb == nil {
+		return nil
+	}
+	return c.rdb.Pipeline()
+}
+

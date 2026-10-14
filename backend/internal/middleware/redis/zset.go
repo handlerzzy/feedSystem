@@ -97,3 +97,20 @@ func (c *Client) ZRevRangeByScore(ctx context.Context, key string, max, min stri
 		Count:  count,
 	}).Result()
 }
+
+// ZScore 返回 ZSet 中指定 member 的 score。若不存在返回 redis.Nil。
+func (c *Client) ZScore(ctx context.Context, key string, member string) (float64, error) {
+	if c == nil || c.rdb == nil {
+		return 0, errors.New("redis client not initialized")
+	}
+	return c.rdb.ZScore(ctx, key, member).Result()
+}
+
+// ZRem 从 ZSet 中移除一个或多个 member。
+func (c *Client) ZRem(ctx context.Context, key string, members ...any) error {
+	if c == nil || c.rdb == nil || len(members) == 0 {
+		return nil
+	}
+	return c.rdb.ZRem(ctx, key, members...).Err()
+}
+

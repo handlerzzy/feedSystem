@@ -44,3 +44,12 @@ func (c *Client) MGet(cacheCtx context.Context, cacheKeys ...string) ([]interfac
 	}
 	return c.rdb.MGet(cacheCtx, cacheKeys...).Result()
 }
+
+// GetInt64 获取 key 对应的 int64 数值。若 key 不存在则返回 0, redis.Nil。
+func (c *Client) GetInt64(ctx context.Context, key string) (int64, error) {
+	if c == nil || c.rdb == nil {
+		return 0, errors.New("redis client not initialized")
+	}
+	return c.rdb.Get(ctx, key).Int64()
+}
+

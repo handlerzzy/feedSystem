@@ -80,6 +80,11 @@ type FeedService struct {
 	exposedFilterTTL time.Duration
 	// onExposedRecorded 是异步写入曝光集合完成时的回调钩子（主要用于测试同步消除竞态）。
 	onExposedRecorded func(accountID uint, ids []uint)
+
+	// racingUserTTL 是单用户赛马防重集合的滑动过期时间（默认 24 小时）。
+	racingUserTTL time.Duration
+	// onRacingRecorded 是异步写入赛马曝光完成时的回调钩子（用于测试同步消除竞态）。
+	onRacingRecorded func(accountID uint, ids []uint)
 }
 
 // CandidateFilter 是"这条候选该不该推给这个用户"的判定。
@@ -133,6 +138,7 @@ func NewFeedService(repo FeedStore, likeRepo LikeLookup, rediscache *rediscache.
 		localcache:       lc,
 		cacheTTL:         24 * time.Hour,
 		exposedFilterTTL: DefaultExposedFilterTTL,
+		racingUserTTL:    DefaultRacingUserTTL,
 	}
 }
 
@@ -515,6 +521,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 			videoIDs[i] = item.ID
 		}
 		f.recordExposedAsync(viewerAccountID, videoIDs)
+		f.recordRacingImpressionsAsync(viewerAccountID, videoIDs)
 	}
 	return resp, nil
 }
