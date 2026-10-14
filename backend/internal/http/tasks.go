@@ -53,6 +53,15 @@ func StartBackgroundTasks(ctx context.Context, deps Deps) (*errgroup.Group, erro
 		return nil
 	})
 
+	// 阶梯流量池赛马结算引擎：后台轮询 ZSet 候选队列，基于 Laplace 平滑分与 24h 兜底执行 CAS 跃迁与喜报推送
+	if deps.Cache != nil {
+		g.Go(func() error {
+			tpWorker := worker.NewTrafficPoolWorker(deps.DB, deps.Cache, deps.SSEHub)
+			_ = tpWorker.Run(ctx)
+			return nil
+		})
+	}
+
 	// SSE notification 拓扑声明（同步执行，与改前一致）
 	if deps.RMQ != nil {
 		if notifCh, err := deps.RMQ.NewChannel(); err == nil {

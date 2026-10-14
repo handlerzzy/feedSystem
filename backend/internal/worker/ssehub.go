@@ -354,6 +354,46 @@ func (h *SSEHub) UnreadCountHandler(c *gin.Context) {
 	c.JSON(200, gin.H{"count": count})
 }
 
+// EventTypePromotion 是视频赛马成功晋升进阶流量池的喜报事件类型。
+const EventTypePromotion = "promotion"
+
+// SSEBroadcaster 定义了向用户广播系统通知（如赛马进阶喜报）的公共契约。
+type SSEBroadcaster interface {
+	BroadcastToUser(userID uint, eventType string, targetID uint, content ...string) (*Notification, error)
+}
+
+// BroadcastToUser 向指定用户广播系统级通知（如进阶喜报）。
+// 若 DB 连接可用，将通知保存至 notifications 表以便客户端历史查询，
+// 随后通过 Push 投递到本进程 SSE 连接并经由 Redis Pub/Sub 广播至其它副本。
+func (h *SSEHub) BroadcastToUser(userID uint, eventType string, targetID uint, content ...string) (*Notification, error) {
+	if h == nil {
+		return nil, errors.New("sse hub is nil")
+	}
+	text := "恭喜！您的作品已成功晋升进阶推荐池！"
+	if len(content) > 0 && content[0] != "" {
+		text = content[0]
+	}
+	notif := &Notification{
+		RecipientID: userID,
+		SenderID:    0, // 0 表示系统官方通知
+		Type:        eventType,
+		TargetID:    targetID,
+		Content:     text,
+		IsRead:      false,
+		CreatedAt:   time.Now(),
+	}
+	if h.db != nil {
+		if err := h.db.Create(notif).Error; err != nil {
+			logging.L().Warn("保存广播通知到数据库失败",
+				zap.Uint("recipient_id", userID),
+				zap.String("type", eventType),
+				zap.Error(err))
+		}
+	}
+	h.Push(userID, notif)
+	return notif, nil
+}
+
 func (h *SSEHub) RegisterRoutes(r *gin.Engine, group *gin.RouterGroup) {
 	group.GET("/stream", h.SSEHandler)
 	group.POST("/list", h.ListHandler)
@@ -362,3 +402,4 @@ func (h *SSEHub) RegisterRoutes(r *gin.Engine, group *gin.RouterGroup) {
 }
 
 var _ NotificationHub = (*SSEHub)(nil)
+var _ SSEBroadcaster = (*SSEHub)(nil)

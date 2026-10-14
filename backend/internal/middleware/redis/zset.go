@@ -98,6 +98,19 @@ func (c *Client) ZRevRangeByScore(ctx context.Context, key string, max, min stri
 	}).Result()
 }
 
+// ZRangeByScore 按分值升序检索 ZSet 元素。
+func (c *Client) ZRangeByScore(ctx context.Context, key string, min, max string, offset, count int64) ([]string, error) {
+	if c == nil || c.rdb == nil {
+		return nil, nil
+	}
+	return c.rdb.ZRangeByScore(ctx, key, &redis.ZRangeBy{
+		Min:    min,
+		Max:    max,
+		Offset: offset,
+		Count:  count,
+	}).Result()
+}
+
 // ZScore 返回 ZSet 中指定 member 的 score。若不存在返回 redis.Nil。
 func (c *Client) ZScore(ctx context.Context, key string, member string) (float64, error) {
 	if c == nil || c.rdb == nil {
