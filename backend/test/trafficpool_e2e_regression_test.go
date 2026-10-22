@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/handlerzzy/feedsystem/internal/worker"
 
 	miniredis "github.com/alicebob/miniredis/v2"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	goredis "github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -214,7 +216,6 @@ func (fakeVectorRecallStore) ListEmbeddingModels(ctx context.Context, dim int, l
 	return []video.EmbeddingModelStat{{Model: "test-model", Dim: 1536}}, nil
 }
 
-
 type mockBroadcaster struct {
 	mu     sync.Mutex
 	calls  []mockBroadcastCall
@@ -280,29 +281,46 @@ func setupE2ETestRedis(t *testing.T) (*rediscache.Client, *miniredis.Miniredis) 
 	return rediscache.NewClient(rdb, "e2etest:"), mr
 }
 
+func TestE2EIntegrationDBRequiresDSN(t *testing.T) {
+	t.Setenv("TEST_MYSQL_DSN", "")
+	var dialCount atomic.Int32
+	mysqldriver.RegisterDialContext("tcp", func(context.Context, string) (net.Conn, error) {
+		dialCount.Add(1)
+		return nil, errors.New("unexpected MySQL connection without TEST_MYSQL_DSN")
+	})
+	t.Cleanup(func() { mysqldriver.DeregisterDialContext("tcp") })
+	t.Run("unconfigured", func(t *testing.T) {
+		openE2EIntegrationDB(t)
+		t.Fatal("integration test must skip when TEST_MYSQL_DSN is unset")
+	})
+	if got := dialCount.Load(); got != 0 {
+		t.Fatalf("attempted %d MySQL connections without TEST_MYSQL_DSN", got)
+	}
+}
+
 func openE2EIntegrationDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_MYSQL_DSN")
 	if dsn == "" {
-		dsn = "root:123456@tcp(172.23.0.8:3306)/feedflow?charset=utf8mb4&parseTime=True&loc=Local"
+		t.Skip("TEST_MYSQL_DSN 未设置，跳过依赖真实 MySQL 的集成测试")
 	}
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		fallbackDSN := "root:123456@tcp(127.0.0.1:3307)/feedflow?charset=utf8mb4&parseTime=True&loc=Local"
-		db, err = gorm.Open(mysql.Open(fallbackDSN), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Silent),
-		})
-	}
-	if err != nil {
-		t.Skipf("跳过 Live MySQL 集成测试：连接数据库失败: %v", err)
+		t.Fatalf("连接测试数据库失败: %v", err)
 	}
 	sqlDB, err := db.DB()
-	if err != nil || sqlDB.Ping() != nil {
-		t.Skipf("跳过 Live MySQL 集成测试：数据库不可达: %v", err)
+	if err != nil {
+		t.Fatalf("获取 sql.DB 失败: %v", err)
 	}
-	_ = db.AutoMigrate(&video.Video{}, &video.Comment{}, &video.Like{}, &worker.Notification{}, &video.OutboxMsg{})
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := sqlDB.Ping(); err != nil {
+		t.Fatalf("数据库不可达: %v", err)
+	}
+	if err := db.AutoMigrate(&video.Video{}, &video.Comment{}, &video.Like{}, &worker.Notification{}, &video.OutboxMsg{}); err != nil {
+		t.Fatalf("AutoMigrate 失败: %v", err)
+	}
 	return db
 }
 
@@ -346,11 +364,11 @@ func TestE2E_FullPipelineRegression_ClosedLoop(t *testing.T) {
 				Description: "点击进入色情专区",
 			},
 			{
-				AuthorID:    authorID,
-				Username:    "creator_alice",
-				Title:       "特殊混淆 b-a-d*w*o*r*d 内容",
-				PlayURL:     "https://cdn.example.com/bad3.mp4",
-				CoverURL:    "https://cdn.example.com/bad3.jpg",
+				AuthorID: authorID,
+				Username: "creator_alice",
+				Title:    "特殊混淆 b-a-d*w*o*r*d 内容",
+				PlayURL:  "https://cdn.example.com/bad3.mp4",
+				CoverURL: "https://cdn.example.com/bad3.jpg",
 			},
 		}
 

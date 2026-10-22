@@ -4,13 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
+	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/handlerzzy/feedsystem/internal/video"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -35,15 +39,15 @@ func (*testConnPool) QueryRowContext(ctx context.Context, query string, args ...
 func (*testConnPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	return nil, nil
 }
-func (*testConnPool) Close() error { return nil }
-func (*testConnPool) ResetSession(ctx context.Context) error { return nil }
-func (*testConnPool) Ping(ctx context.Context) error { return nil }
-func (*testConnPool) Driver() driver.Driver { return nil }
+func (*testConnPool) Close() error                                { return nil }
+func (*testConnPool) ResetSession(ctx context.Context) error      { return nil }
+func (*testConnPool) Ping(ctx context.Context) error              { return nil }
+func (*testConnPool) Driver() driver.Driver                       { return nil }
 func (*testConnPool) Conn(ctx context.Context) (*sql.Conn, error) { return nil, nil }
-func (*testConnPool) SetMaxIdleConns(n int) {}
-func (*testConnPool) SetMaxOpenConns(n int) {}
-func (*testConnPool) SetConnMaxLifetime(d time.Duration) {}
-func (*testConnPool) SetConnMaxIdleTime(d time.Duration) {}
+func (*testConnPool) SetMaxIdleConns(n int)                       {}
+func (*testConnPool) SetMaxOpenConns(n int)                       {}
+func (*testConnPool) SetConnMaxLifetime(d time.Duration)          {}
+func (*testConnPool) SetConnMaxIdleTime(d time.Duration)          {}
 
 type testSQLCaptureLogger struct {
 	logger.Interface
@@ -186,27 +190,42 @@ func TestFeedRepository_ReadIsolation_SQLGeneration(t *testing.T) {
 	})
 }
 
+func TestFeedIntegrationDBRequiresDSN(t *testing.T) {
+	t.Setenv("TEST_MYSQL_DSN", "")
+	var dialCount atomic.Int32
+	mysqldriver.RegisterDialContext("tcp", func(context.Context, string) (net.Conn, error) {
+		dialCount.Add(1)
+		return nil, errors.New("unexpected MySQL connection without TEST_MYSQL_DSN")
+	})
+	t.Cleanup(func() { mysqldriver.DeregisterDialContext("tcp") })
+	t.Run("unconfigured", func(t *testing.T) {
+		openFeedIntegrationDB(t)
+		t.Fatal("integration test must skip when TEST_MYSQL_DSN is unset")
+	})
+	if got := dialCount.Load(); got != 0 {
+		t.Fatalf("attempted %d MySQL connections without TEST_MYSQL_DSN", got)
+	}
+}
+
 func openFeedIntegrationDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_MYSQL_DSN")
 	if dsn == "" {
-		dsn = "root:123456@tcp(172.23.0.8:3306)/feedflow?charset=utf8mb4&parseTime=True&loc=Local"
+		t.Skip("TEST_MYSQL_DSN 未设置，跳过依赖真实 MySQL 的集成测试")
 	}
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		fallbackDSN := "root:123456@tcp(127.0.0.1:3307)/feedflow?charset=utf8mb4&parseTime=True&loc=Local"
-		db, err = gorm.Open(mysql.Open(fallbackDSN), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Silent),
-		})
-	}
-	if err != nil {
-		t.Skipf("跳过 MySQL 集成测试：连接数据库失败: %v", err)
+		t.Fatalf("连接测试数据库失败: %v", err)
 	}
 	sqlDB, err := db.DB()
-	if err != nil || sqlDB.Ping() != nil {
-		t.Skipf("跳过 MySQL 集成测试：数据库不可达: %v", err)
+	if err != nil {
+		t.Fatalf("获取 sql.DB 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := sqlDB.Ping(); err != nil {
+		t.Fatalf("数据库不可达: %v", err)
 	}
 	return db
 }

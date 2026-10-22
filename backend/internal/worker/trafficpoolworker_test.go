@@ -2,7 +2,9 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/handlerzzy/feedsystem/internal/video"
 
 	miniredis "github.com/alicebob/miniredis/v2"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	goredis "github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -163,7 +166,6 @@ func TestSSEHub_BroadcastToUser_WithDBAndDefaultContent(t *testing.T) {
 	}
 }
 
-
 // ---------- Seam 3: CAS 条件更新 SQL 生成与 DryRun 审计 ----------
 
 func TestTrafficPoolWorker_CAS_SQLGeneration(t *testing.T) {
@@ -261,30 +263,51 @@ func setupTestRedis(t *testing.T) (*rediscache.Client, *miniredis.Miniredis) {
 	return rediscache.NewClient(rdb, "test:"), mr
 }
 
+func TestWorkerIntegrationDBRequiresDSN(t *testing.T) {
+	t.Setenv("TEST_MYSQL_DSN", "")
+	var dialCount atomic.Int32
+	mysqldriver.RegisterDialContext("tcp", func(context.Context, string) (net.Conn, error) {
+		dialCount.Add(1)
+		return nil, errors.New("unexpected MySQL connection without TEST_MYSQL_DSN")
+	})
+	t.Cleanup(func() { mysqldriver.DeregisterDialContext("tcp") })
+	for name, openDB := range map[string]func(*testing.T) *gorm.DB{
+		"traffic pool": openWorkerIntegrationDB,
+		"outbox":       openWorkerTestDB,
+	} {
+		t.Run(name, func(t *testing.T) {
+			openDB(t)
+			t.Fatal("integration test must skip when TEST_MYSQL_DSN is unset")
+		})
+	}
+	if got := dialCount.Load(); got != 0 {
+		t.Fatalf("attempted %d MySQL connections without TEST_MYSQL_DSN", got)
+	}
+}
+
 func openWorkerIntegrationDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_MYSQL_DSN")
 	if dsn == "" {
-		dsn = "root:123456@tcp(172.23.0.8:3306)/feedflow?charset=utf8mb4&parseTime=True&loc=Local"
+		t.Skip("TEST_MYSQL_DSN 未设置，跳过依赖真实 MySQL 的集成测试")
 	}
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		// 备用端口重试
-		fallbackDSN := "root:123456@tcp(127.0.0.1:3307)/feedflow?charset=utf8mb4&parseTime=True&loc=Local"
-		db, err = gorm.Open(mysql.Open(fallbackDSN), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Silent),
-		})
-	}
-	if err != nil {
-		t.Skipf("跳过 MySQL 集成测试：连接数据库失败: %v", err)
+		t.Fatalf("连接测试数据库失败: %v", err)
 	}
 	sqlDB, err := db.DB()
-	if err != nil || sqlDB.Ping() != nil {
-		t.Skipf("跳过 MySQL 集成测试：数据库不可达: %v", err)
+	if err != nil {
+		t.Fatalf("获取 sql.DB 失败: %v", err)
 	}
-	_ = db.AutoMigrate(&video.Video{}, &video.Comment{}, &video.Like{}, &Notification{})
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := sqlDB.Ping(); err != nil {
+		t.Fatalf("数据库不可达: %v", err)
+	}
+	if err := db.AutoMigrate(&video.Video{}, &video.Comment{}, &video.Like{}, &Notification{}); err != nil {
+		t.Fatalf("AutoMigrate 失败: %v", err)
+	}
 	return db
 }
 
@@ -841,5 +864,3 @@ func TestTrafficPoolWorker_ObservationWindowAndZeroExposureFallback(t *testing.T
 		}
 	})
 }
-
-

@@ -2,9 +2,9 @@
 backend/.run/
 data/
 .sisyphus/
-# docs/ 目录允许版本控制（ADR, guide 与设计规范）
-!docs/
-!docs/**
+# 本地开发、设计与面试资料，不发布到代码仓库
+/docs/
+/picture/
 AGENTS.md
 .scratch/
 GLOSSARY.md
@@ -15,6 +15,13 @@ GLOSSARY-MAP.md
 简历项目描述.md
 AI-P2-设计决定.md
 FeedFlow-项目设计.md
+/LEARNING_TODO.md
+/MISSION.md
+/NOTES.md
+/RESOURCES.md
+/lessons/
+/reference/
+/assets/
 
 # 求职材料：含真实姓名/手机号/邮箱/微信，绝不入库
 .interview-work/
@@ -58,6 +65,17 @@ go.work.sum
 
 # env file
 .env
+.env.*
+!.env.example
+!.env.*.example
+
+# 本机配置覆盖、运行日志与诊断产物
+*.local.yaml
+*.local.yml
+*.log
+*.pprof
+*.prof
+.DS_Store
 
 # Node 依赖（frontend 与 AI sidecar 都是 Node 项目）
 node_modules/

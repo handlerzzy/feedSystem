@@ -23,5 +23,3 @@
 # 3. 重新录制官方基线快照
 ./run_benchmark.sh --record test/benchmark/baseline.txt
 ```
-
-详细使用指引与 `benchstat` 操作规范请参阅：[docs/benchmark-guide.md](../../docs/benchmark-guide.md)。

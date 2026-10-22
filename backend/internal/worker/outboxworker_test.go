@@ -18,11 +18,17 @@ import (
 type dummyConnPool struct{}
 
 func (*dummyConnPool) PrepareContext(context.Context, string) (*sql.Stmt, error) { return nil, nil }
-func (*dummyConnPool) ExecContext(context.Context, string, ...any) (sql.Result, error) { return nil, nil }
-func (*dummyConnPool) QueryContext(context.Context, string, ...any) (*sql.Rows, error) { return nil, nil }
+func (*dummyConnPool) ExecContext(context.Context, string, ...any) (sql.Result, error) {
+	return nil, nil
+}
+func (*dummyConnPool) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
+	return nil, nil
+}
 func (*dummyConnPool) QueryRowContext(context.Context, string, ...any) *sql.Row { return nil }
-func (d *dummyConnPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) { return d, nil }
-func (*dummyConnPool) Commit() error { return nil }
+func (d *dummyConnPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	return d, nil
+}
+func (*dummyConnPool) Commit() error   { return nil }
 func (*dummyConnPool) Rollback() error { return nil }
 
 type sqlCaptureLogger struct {
@@ -96,19 +102,25 @@ func openWorkerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_MYSQL_DSN")
 	if dsn == "" {
-		dsn = "root:123456@tcp(127.0.0.1:3307)/feedflow?charset=utf8mb4&parseTime=True&loc=Local"
+		t.Skip("TEST_MYSQL_DSN 未设置，跳过依赖真实 MySQL 的集成测试")
 	}
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		t.Skipf("跳过 outbox worker 集成测试：连接数据库失败: %v", err)
+		t.Fatalf("连接测试数据库失败: %v", err)
 	}
 	sqlDB, err := db.DB()
-	if err != nil || sqlDB.Ping() != nil {
-		t.Skipf("跳过 outbox worker 集成测试：数据库不可达: %v", err)
+	if err != nil {
+		t.Fatalf("获取 sql.DB 失败: %v", err)
 	}
-	_ = db.AutoMigrate(&video.OutboxMsg{})
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := sqlDB.Ping(); err != nil {
+		t.Fatalf("数据库不可达: %v", err)
+	}
+	if err := db.AutoMigrate(&video.OutboxMsg{}); err != nil {
+		t.Fatalf("AutoMigrate 失败: %v", err)
+	}
 	return db
 }
 
