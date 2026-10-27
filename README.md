@@ -2,12 +2,11 @@
 
 基于 Go + Vue 3 的短视频 Feed 系统，含账号、视频、点赞、评论、关注、Feed 流、私信、通知，支持 Redis 缓存、RabbitMQ 异步 Worker、分片上传、SSE 实时推送、Docker Compose 部署。
 
-## 来源与二次开发说明
+## 项目说明
 
-本项目基于开源项目 [LeoninCS/feedsystem_video_go](https://github.com/LeoninCS/feedsystem_video_go)
-二次开发，原项目采用 Go + Vue 3 实现账号、视频、点赞、评论、关注、Feed 与私信等基础能力。
+本项目参考开源项目开发，并结合短视频业务进行功能扩展与工程改造，采用 Go + Vue 3 实现账号、视频、点赞、评论、关注、Feed 与私信等能力。
 
-在此基础上重新设计并实现的部分包括：
+主要开发与改造方向包括：
 
 - **Feed 读路径**：Redis ZSET 全局时间线 + 冷热拼接 + 三级缓存，并加入时间线自愈
 - **发布链路**：outbox 事务性消息 + `SKIP LOCKED` 抢占，替代同步写时间线
@@ -16,8 +15,6 @@
   推荐理由，以及一套按用户口径的离线评测
 - **工程质量**：zap 结构化日志与请求 id 关联、`/livez` `/readyz` 分级健康检查、
   分片上传断点续传、端到端回归脚本与 CI
-
-感谢原作者将项目开源。
 
 ## 功能
 
